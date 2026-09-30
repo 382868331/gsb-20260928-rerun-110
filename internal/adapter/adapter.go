@@ -25,6 +25,10 @@ func NewRegistry(adapters ...Adapter) *Registry {
 	return r
 }
 
+func (r *Registry) Register(a Adapter) {
+	r.adapters[a.Type()] = a
+}
+
 func (r *Registry) Get(deviceType string) (Adapter, error) {
 	a, ok := r.adapters[deviceType]
 	if !ok {

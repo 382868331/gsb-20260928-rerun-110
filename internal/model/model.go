@@ -17,6 +17,7 @@ type RawMessage struct {
 	HardwareID  string    `json:"hardware_id"`
 	BootID      string    `json:"boot_id"`
 	Sequence    int64     `json:"sequence"`
+	Format      string    `json:"format,omitempty"`
 	ContentType string    `json:"content_type"`
 	Payload     []byte    `json:"payload"`
 	ReceivedAt  time.Time `json:"received_at"`
@@ -36,6 +37,17 @@ type Observation struct {
 type RawDelivery struct {
 	BootID      string
 	Sequence    int64
+	Format      string
 	ContentType string
 	Payload     []byte
+}
+
+type RawReference struct {
+	DeliveryID  string `json:"delivery_id"`
+	IdentityID  string `json:"identity_id"`
+	BootID      string `json:"boot_id"`
+	Sequence    int64  `json:"sequence"`
+	Format      string `json:"format,omitempty"`
+	ContentType string `json:"content_type"`
+	PayloadSHA  string `json:"payload_sha256"`
 }

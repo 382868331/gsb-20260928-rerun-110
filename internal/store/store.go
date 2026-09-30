@@ -23,13 +23,16 @@ type JournalRecord struct {
 	Kind        string                `json:"kind"`
 	Identity    *model.DeviceIdentity `json:"identity,omitempty"`
 	Raw         *StoredRawMessage     `json:"raw,omitempty"`
+	RawRef      *model.RawReference   `json:"raw_ref,omitempty"`
 	Observation *model.Observation    `json:"observation,omitempty"`
 	Sequence    *SequenceProgress     `json:"sequence,omitempty"`
+	Confirmed   *ConfirmedSequence    `json:"confirmed,omitempty"`
 	Checksum    string                `json:"checksum,omitempty"`
 }
 
 type StoredRawMessage struct {
 	model.RawMessage
+	Status      string `json:"status,omitempty"`
 	DuplicateOf string `json:"duplicate_of,omitempty"`
 }
 
@@ -37,6 +40,12 @@ type SequenceProgress struct {
 	IdentityID string `json:"identity_id"`
 	BootID     string `json:"boot_id"`
 	Start      int64  `json:"start"`
+	Last       int64  `json:"last"`
+}
+
+type ConfirmedSequence struct {
+	IdentityID string `json:"identity_id"`
+	BootID     string `json:"boot_id"`
 	Last       int64  `json:"last"`
 }
 
@@ -50,6 +59,10 @@ type Store struct {
 	seenObs    map[string]struct{}
 	sequences  map[string]SequenceProgress
 	delivered  map[string]map[int64]struct{}
+	payloads   map[string]map[int64]string
+	confirmed  map[string]map[int64]struct{}
+	pending    map[string]model.RawMessage
+	pendingIDs []string
 }
 
 func Open(dir string) (*Store, error) {
@@ -70,6 +83,9 @@ func Open(dir string) (*Store, error) {
 		seenObs:    make(map[string]struct{}),
 		sequences:  make(map[string]SequenceProgress),
 		delivered:  make(map[string]map[int64]struct{}),
+		payloads:   make(map[string]map[int64]string),
+		confirmed:  make(map[string]map[int64]struct{}),
+		pending:    make(map[string]model.RawMessage),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -95,6 +111,20 @@ func (s *Store) RegisterIdentity(identity model.DeviceIdentity) error {
 	defer s.mu.Unlock()
 	if _, exists := s.identities[identity.ID]; exists {
 		return nil
+	}
+	record := JournalRecord{Kind: "identity", Identity: &identity}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) UpdateIdentity(identity model.DeviceIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.identities[identity.ID]; !exists {
+		return ErrNotFound
 	}
 	record := JournalRecord{Kind: "identity", Identity: &identity}
 	if err := s.append(record); err != nil {
@@ -161,6 +191,18 @@ func (s *Store) Sequence(identityID, bootID string) (SequenceProgress, bool) {
 	return p, ok
 }
 
+func (s *Store) Confirmed(identityID, bootID string) (ConfirmedSequence, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	confirmed, ok := s.confirmed[sequenceKey(identityID, bootID)]
+	if !ok {
+		return ConfirmedSequence{}, false
+	}
+	progress := s.sequences[sequenceKey(identityID, bootID)]
+	last, ok := highestContiguous(confirmed, progress.Start)
+	return ConfirmedSequence{IdentityID: identityID, BootID: bootID, Last: last}, ok
+}
+
 func (s *Store) Missing(identityID, bootID string) []int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -182,45 +224,164 @@ func (s *Store) Missing(identityID, bootID string) []int64 {
 	return missing
 }
 
+func (s *Store) PendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending)
+}
+
+func highestContiguous(set map[int64]struct{}, start int64) (int64, bool) {
+	last := start - 1
+	found := false
+	for {
+		if _, ok := set[start]; !ok {
+			return last, found
+		}
+		found = true
+		last = start
+		start++
+	}
+}
+
 type IngestResult struct {
 	Duplicate   bool
 	DuplicateOf string
+	Pending     bool
+	Conflict    bool
 	Observation *model.Observation
 }
 
 func (s *Store) Ingest(raw model.RawMessage, observation *model.Observation) (IngestResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result := IngestResult{Observation: observation}
-	storedRaw := StoredRawMessage{RawMessage: raw}
+	return s.ingestLocked(raw, observation, observation == nil)
+}
+
+func (s *Store) StorePending(raw model.RawMessage) (IngestResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ingestLocked(raw, nil, true)
+}
+
+func (s *Store) Pending() []model.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := make([]model.RawMessage, 0, len(s.pendingIDs))
+	for _, id := range s.pendingIDs {
+		if raw, ok := s.pending[id]; ok {
+			pending = append(pending, cloneRaw(raw))
+		}
+	}
+	return pending
+}
+
+func (s *Store) Confirm(raw model.RawMessage, observation model.Observation) (IngestResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deliveryKey := sequenceKey(raw.IdentityID, raw.BootID)
+	existingPayload, rawExists := s.payloads[deliveryKey][raw.Sequence]
+	if rawExists && existingPayload != PayloadSHA(raw.Payload) {
+		return IngestResult{Conflict: true}, fmt.Errorf("sequence %d in boot %s already contains different raw content", raw.Sequence, raw.BootID)
+	}
+	storedRaw, pendingExists := s.pending[raw.DeliveryID]
+	if rawExists && (!pendingExists || PayloadSHA(storedRaw.Payload) != PayloadSHA(raw.Payload)) {
+		return IngestResult{}, fmt.Errorf("delivery %s was not stored as a pending raw message", raw.DeliveryID)
+	}
+	obKey := observationKey(observation.IdentityID, observation.ID)
+	if _, duplicate := s.seenObs[obKey]; duplicate {
+		record := JournalRecord{
+			Kind: "duplicate_observation",
+			RawRef: &model.RawReference{
+				DeliveryID:  raw.DeliveryID,
+				IdentityID:  raw.IdentityID,
+				BootID:      raw.BootID,
+				Sequence:    raw.Sequence,
+				Format:      raw.Format,
+				ContentType: raw.ContentType,
+				PayloadSHA:  PayloadSHA(raw.Payload),
+			},
+			Confirmed: &ConfirmedSequence{IdentityID: raw.IdentityID, BootID: raw.BootID, Last: raw.Sequence},
+		}
+		if err := s.append(record); err != nil {
+			return IngestResult{}, err
+		}
+		s.apply(record)
+		return IngestResult{Duplicate: true, DuplicateOf: obKey, Observation: nil}, nil
+	}
+	reference := model.RawReference{
+		DeliveryID:  raw.DeliveryID,
+		IdentityID:  raw.IdentityID,
+		BootID:      raw.BootID,
+		Sequence:    raw.Sequence,
+		Format:      raw.Format,
+		ContentType: raw.ContentType,
+		PayloadSHA:  PayloadSHA(raw.Payload),
+	}
+	confirmed := ConfirmedSequence{IdentityID: raw.IdentityID, BootID: raw.BootID, Last: raw.Sequence}
+	record := JournalRecord{Kind: "observation", RawRef: &reference, Observation: &observation, Confirmed: &confirmed}
+	if err := s.append(record); err != nil {
+		return IngestResult{}, err
+	}
+	s.apply(record)
+	return IngestResult{Observation: &observation}, nil
+}
+
+func PayloadSHA(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) ingestLocked(raw model.RawMessage, observation *model.Observation, pending bool) (IngestResult, error) {
+	result := IngestResult{Observation: observation, Pending: pending}
 	key := sequenceKey(raw.IdentityID, raw.BootID)
+	if existing, ok := s.payloads[key][raw.Sequence]; ok {
+		if existing != PayloadSHA(raw.Payload) {
+			return IngestResult{Conflict: true}, fmt.Errorf("sequence %d in boot %s already contains different raw content", raw.Sequence, raw.BootID)
+		}
+		if pending {
+			if _, isPending := s.pending[raw.DeliveryID]; isPending {
+				return IngestResult{Pending: true}, nil
+			}
+		}
+	}
 	progress, exists := s.sequences[key]
-	if !exists {
-		progress = SequenceProgress{IdentityID: raw.IdentityID, BootID: raw.BootID, Start: raw.Sequence, Last: raw.Sequence - 1}
+	storedRaw := StoredRawMessage{RawMessage: raw}
+	if pending {
+		storedRaw.Status = "pending"
+	} else {
+		storedRaw.Status = "confirmed"
 	}
 	if observation != nil {
 		obKey := observationKey(observation.IdentityID, observation.ID)
 		if _, duplicate := s.seenObs[obKey]; duplicate {
+			storedRaw.Status = "duplicate"
 			storedRaw.DuplicateOf = obKey
 			result.Duplicate = true
 			result.DuplicateOf = obKey
+			result.Pending = false
 			result.Observation = nil
 		}
 	}
-	var progressUpdate *SequenceProgress
-	if !exists || raw.Sequence > progress.Last {
+	if !exists {
+		progress = SequenceProgress{IdentityID: raw.IdentityID, BootID: raw.BootID, Start: raw.Sequence, Last: raw.Sequence}
+	} else if raw.Sequence > progress.Last {
 		progress.Last = raw.Sequence
-		progressUpdate = &progress
 	}
-	record := JournalRecord{Kind: "ingest", Raw: &storedRaw, Sequence: progressUpdate}
+	record := JournalRecord{Kind: "ingest", Raw: &storedRaw, Sequence: &progress}
 	if observation != nil && !result.Duplicate {
 		record.Observation = observation
+		record.Confirmed = &ConfirmedSequence{IdentityID: raw.IdentityID, BootID: raw.BootID, Last: raw.Sequence}
 	}
 	if err := s.append(record); err != nil {
 		return IngestResult{}, err
 	}
 	s.apply(record)
 	return result, nil
+}
+
+func cloneRaw(raw model.RawMessage) model.RawMessage {
+	raw.Payload = append([]byte(nil), raw.Payload...)
+	return raw
 }
 
 func (s *Store) ReadAll() ([]JournalRecord, error) {
@@ -291,6 +452,24 @@ func (s *Store) apply(record JournalRecord) {
 				s.delivered[key] = make(map[int64]struct{})
 			}
 			s.delivered[key][record.Raw.Sequence] = struct{}{}
+			if s.payloads[key] == nil {
+				s.payloads[key] = make(map[int64]string)
+			}
+			s.payloads[key][record.Raw.Sequence] = PayloadSHA(record.Raw.Payload)
+			if record.Raw.Status == "pending" {
+				if _, exists := s.pending[record.Raw.DeliveryID]; !exists {
+					s.pending[record.Raw.DeliveryID] = cloneRaw(record.Raw.RawMessage)
+					s.pendingIDs = append(s.pendingIDs, record.Raw.DeliveryID)
+				}
+			} else {
+				delete(s.pending, record.Raw.DeliveryID)
+			}
+			if s.confirmed[key] == nil {
+				s.confirmed[key] = make(map[int64]struct{})
+			}
+			if record.Raw.Status != "pending" && record.Observation != nil {
+				s.confirmed[key][record.Raw.Sequence] = struct{}{}
+			}
 		}
 		if record.Raw != nil && record.Raw.DuplicateOf != "" {
 			s.seenObs[record.Raw.DuplicateOf] = struct{}{}
@@ -316,13 +495,38 @@ func (s *Store) apply(record JournalRecord) {
 			s.seenObs[record.Raw.DuplicateOf] = struct{}{}
 		}
 	case "observation":
-		if record.Observation != nil {
-			s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
-		}
+		s.applyObservation(record)
+	case "duplicate_observation":
+		s.applyObservation(record)
 	case "sequence":
 		if record.Sequence != nil {
 			s.sequences[sequenceKey(record.Sequence.IdentityID, record.Sequence.BootID)] = *record.Sequence
 		}
+	}
+}
+
+func (s *Store) applyObservation(record JournalRecord) {
+	if record.RawRef != nil {
+		key := sequenceKey(record.RawRef.IdentityID, record.RawRef.BootID)
+		if s.confirmed[key] == nil {
+			s.confirmed[key] = make(map[int64]struct{})
+		}
+		s.confirmed[key][record.RawRef.Sequence] = struct{}{}
+		deliveryID := record.RawRef.DeliveryID
+		if deliveryID == "" {
+			deliveryID = sequenceKey(record.RawRef.IdentityID, record.RawRef.BootID) + ":" + fmt.Sprint(record.RawRef.Sequence)
+		}
+		delete(s.pending, deliveryID)
+	}
+	if record.Observation != nil {
+		s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
+	}
+	if record.Confirmed != nil {
+		key := sequenceKey(record.Confirmed.IdentityID, record.Confirmed.BootID)
+		if s.confirmed[key] == nil {
+			s.confirmed[key] = make(map[int64]struct{})
+		}
+		s.confirmed[key][record.Confirmed.Last] = struct{}{}
 	}
 }
 

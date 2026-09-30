@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"edge-ingest/internal/adapter"
 	"edge-ingest/internal/device"
 	"edge-ingest/internal/hub"
 	"edge-ingest/internal/model"
@@ -30,7 +29,7 @@ func run(dataDir string) error {
 		return err
 	}
 	defer s.Close()
-	adapters := adapter.NewRegistry(device.TemperatureAdapter{}, device.VibrationAdapter{})
+	adapters := hub.DefaultAdapters()
 	h := hub.New(s, adapters)
 	now := time.Now().UTC()
 	if err := h.Provision("demo-temperature", "hw-temperature", device.TemperatureType, now); err != nil {
