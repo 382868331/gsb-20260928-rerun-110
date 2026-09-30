@@ -6,7 +6,10 @@ import (
 	"edge-ingest/internal/model"
 )
 
-var ErrUnknownDeviceType = errors.New("unknown device type")
+var (
+	ErrUnknownDeviceType = errors.New("unknown device type")
+	ErrUnsupportedFormat = errors.New("unsupported message format")
+)
 
 type Adapter interface {
 	Type() string

@@ -1,6 +1,8 @@
 package hub_test
 
 import (
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +11,7 @@ import (
 	"edge-ingest/internal/adapter"
 	"edge-ingest/internal/device"
 	"edge-ingest/internal/hub"
+	"edge-ingest/internal/model"
 	"edge-ingest/internal/store"
 )
 
@@ -186,5 +189,159 @@ func TestTornTailRecordIsNotCompleted(t *testing.T) {
 	}
 	if obs != 1 {
 		t.Fatalf("observations after torn tail = %d", obs)
+	}
+}
+
+func TestFormatEvolutionReplayDoesNotRewriteHistory(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHub := hub.New(s, adapter.NewRegistry(device.TemperatureV1Adapter{}))
+	now := time.Date(2026, 9, 29, 9, 0, 0, 0, time.UTC)
+	if err := oldHub.Provision("temp-old", "hw-temp", device.TemperatureType, now); err != nil {
+		t.Fatal(err)
+	}
+	d := device.NewTemperature("temp-old", "hw-temp", "boot-a", 1)
+	upgraded := d.ReadingV2(now.Add(time.Second), 70, 40)
+	ack, err := oldHub.Receive("temp-old", upgraded)
+	if err != nil || !ack.Stored || !ack.Pending {
+		t.Fatalf("unknown format ack = %+v, %v", ack, err)
+	}
+	conflictDevice := device.NewTemperature("temp-old", "hw-temp", "boot-a", 1)
+	conflict := conflictDevice.ReadingV2(now.Add(time.Second), 71, 40)
+	if _, err := oldHub.Receive("temp-old", conflict); !errors.Is(err, store.ErrSequenceConflict) {
+		t.Fatalf("same sequence with different raw payload = %v, want conflict", err)
+	}
+	malformed := model.RawDelivery{BootID: "boot-a", Sequence: 2, ContentType: "application/json", Payload: []byte("{bad")}
+	if _, err := oldHub.Receive("temp-old", malformed); err == nil {
+		t.Fatal("malformed supported-format message must not be retained as pending")
+	}
+	historical := d.Reading(now.Add(2*time.Second), 21, 41)
+	if _, err := oldHub.Receive("temp-old", historical); err != nil {
+		t.Fatal(err)
+	}
+	resume, err := oldHub.Resume("temp-old", "boot-a")
+	if err != nil || resume.NextSequence != 3 || len(resume.Missing) != 0 {
+		t.Fatalf("resume after failed and pending messages = %+v, %v", resume, err)
+	}
+	if _, err := oldHub.ReplaceIdentity("temp-old", "temp-new", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHub := hub.New(s2, adapter.NewRegistry(device.TemperatureV2Adapter{}))
+	acks, err := newHub.RetryPending()
+	if err != nil || len(acks) != 1 || !acks[0].Stored || acks[0].Duplicate {
+		t.Fatalf("retry pending = %+v, %v", acks, err)
+	}
+	if acks[0].IdentityID != "temp-old" || acks[0].BootID != "boot-a" || acks[0].Sequence != 1 {
+		t.Fatalf("pending identity/location changed: %+v", acks[0])
+	}
+	records, err := s2.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawCount, observationCount int
+	var upgradedObservation, historicalObservation *model.Observation
+	for i := range records {
+		r := records[i]
+		if r.Raw != nil {
+			rawCount++
+			if r.Raw.Sequence == 1 {
+				if r.Raw.IdentityID != "temp-old" || r.Raw.HardwareID != "hw-temp" || string(r.Raw.Payload) != string(upgraded.Payload) {
+					t.Fatalf("pending raw identity/content changed: %+v", r.Raw.RawMessage)
+				}
+			}
+		}
+		if r.Observation != nil {
+			observationCount++
+			switch r.Observation.Attributes["format_version"] {
+			case "temperature_v2":
+				upgradedObservation = r.Observation
+			case "temperature_v1":
+				historicalObservation = r.Observation
+			}
+		}
+	}
+	if rawCount != 2 || observationCount != 2 {
+		t.Fatalf("raw=%d observations=%d", rawCount, observationCount)
+	}
+	if upgradedObservation == nil || upgradedObservation.IdentityID != "temp-old" {
+		t.Fatalf("upgraded observation was not confirmed against original identity: %+v", upgradedObservation)
+	}
+	if got := upgradedObservation.Measures["temperature_c"]; math.Abs(got-21.11111111111111) > 0.000001 {
+		t.Fatalf("upgraded temperature decoded incorrectly: %v", got)
+	}
+	if historicalObservation == nil || historicalObservation.Measures["temperature_c"] != 21 {
+		t.Fatalf("historical temperature was recalculated: %+v", historicalObservation)
+	}
+	retryAgain, err := newHub.RetryPending()
+	if err != nil || len(retryAgain) != 0 {
+		t.Fatalf("resolved pending retried again: %+v, %v", retryAgain, err)
+	}
+
+	newDevice := device.NewTemperature("temp-new", "hw-temp", "boot-a", 1)
+	sameObservationID := newDevice.ReadingV2(now.Add(time.Second), 70, 40)
+	newAck, err := newHub.Receive("temp-new", sameObservationID)
+	if err != nil || newAck.Duplicate {
+		t.Fatalf("same observation ID under replacement identity = %+v, %v", newAck, err)
+	}
+}
+
+func TestPendingSurvivesTornTailAndRecovery(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHub := hub.New(s, adapter.NewRegistry(device.TemperatureV1Adapter{}))
+	now := time.Now().UTC()
+	if err := oldHub.Provision("temp-1", "hw", device.TemperatureType, now); err != nil {
+		t.Fatal(err)
+	}
+	d := device.NewTemperature("temp-1", "hw", "boot", 1)
+	pending := d.ReadingV2(now.Add(time.Second), 69.8, 40)
+	if _, err := oldHub.Receive("temp-1", pending); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "journal.jsonl")
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	torn := append(append([]byte(nil), good...), []byte("{\"kind\":\"ingest\",partial")...)
+	if err := os.WriteFile(path, torn, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingMessages := s2.PendingMessages()
+	if len(pendingMessages) != 1 {
+		t.Fatalf("pending recovered incorrectly: %+v", pendingMessages)
+	}
+	if got := string(pendingMessages[0].Payload); got != string(pending.Payload) {
+		t.Fatalf("pending payload changed:\n got: %s\nwant: %s", got, pending.Payload)
+	}
+	newHub := hub.New(s2, adapter.NewRegistry(device.TemperatureV2Adapter{}))
+	acks, err := newHub.RetryPending()
+	if err != nil || len(acks) != 1 || !acks[0].Stored {
+		t.Fatalf("retry after torn tail = %+v, %v", acks, err)
+	}
+	resume, err := newHub.Resume("temp-1", "boot")
+	if err != nil || resume.NextSequence != 2 || len(resume.Missing) != 0 {
+		t.Fatalf("resume after torn tail = %+v, %v", resume, err)
 	}
 }

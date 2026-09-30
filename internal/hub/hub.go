@@ -1,7 +1,9 @@
 package hub
 
 import (
+	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ type Ack struct {
 	Sequence   int64  `json:"sequence"`
 	Duplicate  bool   `json:"duplicate"`
 	Stored     bool   `json:"stored"`
+	Pending    bool   `json:"pending,omitempty"`
 }
 
 type ResumeState struct {
@@ -120,6 +123,20 @@ func (h *Hub) Receive(identityID string, delivery model.RawDelivery) (Ack, error
 		ReceivedAt:  receivedAt,
 	}
 	observation, err := codec.Decode(raw)
+	if errors.Is(err, adapter.ErrUnsupportedFormat) {
+		result, storeErr := h.store.IngestPending(raw)
+		if storeErr != nil {
+			return Ack{}, storeErr
+		}
+		return Ack{
+			IdentityID: identityID,
+			BootID:     delivery.BootID,
+			Sequence:   delivery.Sequence,
+			Duplicate:  result.Duplicate,
+			Stored:     true,
+			Pending:    true,
+		}, nil
+	}
 	if err != nil {
 		return Ack{}, err
 	}
@@ -134,6 +151,53 @@ func (h *Hub) Receive(identityID string, delivery model.RawDelivery) (Ack, error
 		Duplicate:  result.Duplicate,
 		Stored:     true,
 	}, nil
+}
+
+func (h *Hub) RetryPending() ([]Ack, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	messages := h.store.PendingMessages()
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].IdentityID != messages[j].IdentityID {
+			return messages[i].IdentityID < messages[j].IdentityID
+		}
+		if messages[i].BootID != messages[j].BootID {
+			return messages[i].BootID < messages[j].BootID
+		}
+		return messages[i].Sequence < messages[j].Sequence
+	})
+	acks := make([]Ack, 0, len(messages))
+	for _, stored := range messages {
+		identity, err := h.store.GetIdentity(stored.IdentityID)
+		if err != nil {
+			return acks, err
+		}
+		codec, err := h.adapters.Get(identity.Type)
+		if err != nil {
+			return acks, err
+		}
+		raw := stored.RawMessage
+		observation, err := codec.Decode(raw)
+		if errors.Is(err, adapter.ErrUnsupportedFormat) {
+			continue
+		}
+		if err != nil {
+			return acks, err
+		}
+		result, err := h.store.ResolvePending(raw.DeliveryID, observation)
+		if err != nil {
+			return acks, err
+		}
+		acks = append(acks, Ack{
+			IdentityID: identity.ID,
+			BootID:     raw.BootID,
+			Sequence:   raw.Sequence,
+			Duplicate:  result.Duplicate,
+			Stored:     !result.Duplicate,
+		})
+	}
+	return acks, nil
 }
 
 func DefaultAdapters() *adapter.Registry {
