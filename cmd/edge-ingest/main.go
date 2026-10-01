@@ -64,7 +64,40 @@ func run(dataDir string) error {
 		return err
 	}
 	acks = append(acks, duplicate)
+	report, err := h.Reinterpret(demoCorrectedRule{}, hub.ReinterpretFilter{IdentityID: "demo-temperature"})
+	if err != nil {
+		return err
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(map[string]any{"acks": acks, "resume": resume})
+	return enc.Encode(map[string]any{"acks": acks, "resume": resume, "reinterpret": report})
+}
+
+// demoCorrectedRule demonstrates reinterpreting stored raw messages with a
+// corrected calibration rule while keeping the original observations.
+type demoCorrectedRule struct{}
+
+func (demoCorrectedRule) Type() string { return "temperature_v1_corrected" }
+
+func (demoCorrectedRule) Decode(msg model.RawMessage) (model.Observation, error) {
+	var p device.TemperaturePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return model.Observation{}, err
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, p.ObservedAt)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	return model.Observation{
+		ID:         p.ObservationID,
+		IdentityID: msg.IdentityID,
+		HardwareID: msg.HardwareID,
+		Type:       "temperature_v1_corrected",
+		ObservedAt: observedAt,
+		ReceivedAt: msg.ReceivedAt,
+		Measures: map[string]float64{
+			"temperature_c": p.Celsius + 0.3,
+			"humidity_pct":  p.HumidityPct,
+		},
+	}, nil
 }

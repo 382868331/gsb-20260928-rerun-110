@@ -27,7 +27,18 @@ type JournalRecord struct {
 	Observation *model.Observation    `json:"observation,omitempty"`
 	Sequence    *SequenceProgress     `json:"sequence,omitempty"`
 	Confirmed   *ConfirmedSequence    `json:"confirmed,omitempty"`
+	Rule        string                `json:"rule,omitempty"`
+	Comparison  *model.Comparison     `json:"comparison,omitempty"`
+	Conflict    *ConflictEvidence     `json:"conflict,omitempty"`
 	Checksum    string                `json:"checksum,omitempty"`
+}
+
+// ConflictEvidence preserves both sides of a same-sequence conflict:
+// the previously stored raw reference and the rejected incoming raw.
+type ConflictEvidence struct {
+	Existing   model.RawReference `json:"existing"`
+	Incoming   StoredRawMessage   `json:"incoming"`
+	RecordedAt time.Time          `json:"recorded_at"`
 }
 
 type StoredRawMessage struct {
@@ -50,19 +61,25 @@ type ConfirmedSequence struct {
 }
 
 type Store struct {
-	mu         sync.Mutex
-	path       string
-	f          *os.File
-	writer     *bufio.Writer
-	identities map[string]model.DeviceIdentity
-	byHardware map[string]string
-	seenObs    map[string]struct{}
-	sequences  map[string]SequenceProgress
-	delivered  map[string]map[int64]struct{}
-	payloads   map[string]map[int64]string
-	confirmed  map[string]map[int64]struct{}
-	pending    map[string]model.RawMessage
-	pendingIDs []string
+	mu                 sync.Mutex
+	path               string
+	f                  *os.File
+	writer             *bufio.Writer
+	identities         map[string]model.DeviceIdentity
+	byHardware         map[string]string
+	seenObs            map[string]struct{}
+	sequences          map[string]SequenceProgress
+	delivered          map[string]map[int64]struct{}
+	payloads           map[string]map[int64]string
+	confirmed          map[string]map[int64]struct{}
+	pending            map[string]model.RawMessage
+	pendingIDs         []string
+	raws               map[string]StoredRawMessage
+	rawOrder           []string
+	obsByDelivery      map[string]model.Observation
+	reinterpreted      map[string]struct{}
+	reinterpretRecords []JournalRecord
+	conflicts          []ConflictEvidence
 }
 
 func Open(dir string) (*Store, error) {
@@ -75,17 +92,20 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		path:       path,
-		f:          f,
-		writer:     bufio.NewWriter(f),
-		identities: make(map[string]model.DeviceIdentity),
-		byHardware: make(map[string]string),
-		seenObs:    make(map[string]struct{}),
-		sequences:  make(map[string]SequenceProgress),
-		delivered:  make(map[string]map[int64]struct{}),
-		payloads:   make(map[string]map[int64]string),
-		confirmed:  make(map[string]map[int64]struct{}),
-		pending:    make(map[string]model.RawMessage),
+		path:          path,
+		f:             f,
+		writer:        bufio.NewWriter(f),
+		identities:    make(map[string]model.DeviceIdentity),
+		byHardware:    make(map[string]string),
+		seenObs:       make(map[string]struct{}),
+		sequences:     make(map[string]SequenceProgress),
+		delivered:     make(map[string]map[int64]struct{}),
+		payloads:      make(map[string]map[int64]string),
+		confirmed:     make(map[string]map[int64]struct{}),
+		pending:       make(map[string]model.RawMessage),
+		raws:          make(map[string]StoredRawMessage),
+		obsByDelivery: make(map[string]model.Observation),
+		reinterpreted: make(map[string]struct{}),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -281,6 +301,7 @@ func (s *Store) Confirm(raw model.RawMessage, observation model.Observation) (In
 	deliveryKey := sequenceKey(raw.IdentityID, raw.BootID)
 	existingPayload, rawExists := s.payloads[deliveryKey][raw.Sequence]
 	if rawExists && existingPayload != PayloadSHA(raw.Payload) {
+		s.recordConflictLocked(raw, existingPayload)
 		return IngestResult{Conflict: true}, fmt.Errorf("sequence %d in boot %s already contains different raw content", raw.Sequence, raw.BootID)
 	}
 	storedRaw, pendingExists := s.pending[raw.DeliveryID]
@@ -326,6 +347,120 @@ func (s *Store) Confirm(raw model.RawMessage, observation model.Observation) (In
 	return IngestResult{Observation: &observation}, nil
 }
 
+// recordConflictLocked appends a conflict evidence record. The sequence
+// watermarks are not touched: the rejected raw never advances progress.
+func (s *Store) recordConflictLocked(raw model.RawMessage, existingSHA string) error {
+	evidence := ConflictEvidence{
+		Existing: model.RawReference{
+			DeliveryID: raw.DeliveryID,
+			IdentityID: raw.IdentityID,
+			BootID:     raw.BootID,
+			Sequence:   raw.Sequence,
+			PayloadSHA: existingSHA,
+		},
+		Incoming:   StoredRawMessage{RawMessage: cloneRaw(raw), Status: "conflict"},
+		RecordedAt: time.Now().UTC(),
+	}
+	record := JournalRecord{Kind: "conflict", Conflict: &evidence}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Conflicts() []ConflictEvidence {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ConflictEvidence(nil), s.conflicts...)
+}
+
+// RawMessages returns stored raw messages, optionally filtered by identity
+// and receive-time range (zero bounds are ignored). Pending and confirmed
+// raws are both included so reinterpretation can cover every stored message.
+func (s *Store) RawMessages(identityID string, from, to time.Time) []StoredRawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []StoredRawMessage
+	for _, id := range s.rawOrder {
+		raw := s.raws[id]
+		if identityID != "" && raw.IdentityID != identityID {
+			continue
+		}
+		if !from.IsZero() && raw.ReceivedAt.Before(from) {
+			continue
+		}
+		if !to.IsZero() && raw.ReceivedAt.After(to) {
+			continue
+		}
+		out = append(out, StoredRawMessage{RawMessage: cloneRaw(raw.RawMessage), Status: raw.Status, DuplicateOf: raw.DuplicateOf})
+	}
+	return out
+}
+
+// ObservationFor returns the confirmed observation produced for a delivery.
+func (s *Store) ObservationFor(deliveryID string) (model.Observation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	obs, ok := s.obsByDelivery[deliveryID]
+	return obs, ok
+}
+
+// Reinterpreted reports whether a delivery was already reinterpreted with
+// the given rule, which keeps reprocessing idempotent across restarts.
+func (s *Store) Reinterpreted(deliveryID, rule string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.reinterpreted[reinterpretKey(deliveryID, rule)]
+	return ok
+}
+
+// Reinterpret atomically stores a reinterpretation of a stored raw message
+// under a corrected rule. The original observation is never modified.
+func (s *Store) Reinterpret(raw model.RawMessage, rule string, observation model.Observation, comparison model.Comparison) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.reinterpreted[reinterpretKey(raw.DeliveryID, rule)]; ok {
+		return nil
+	}
+	reference := model.RawReference{
+		DeliveryID:  raw.DeliveryID,
+		IdentityID:  raw.IdentityID,
+		BootID:      raw.BootID,
+		Sequence:    raw.Sequence,
+		Format:      raw.Format,
+		ContentType: raw.ContentType,
+		PayloadSHA:  PayloadSHA(raw.Payload),
+	}
+	record := JournalRecord{
+		Kind:        "reinterpretation",
+		RawRef:      &reference,
+		Observation: &observation,
+		Rule:        rule,
+		Comparison:  &comparison,
+	}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+// Reinterpretations lists stored reinterpretation records for comparison output.
+func (s *Store) Reinterpretations() []JournalRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []JournalRecord
+	for _, record := range s.reinterpretRecords {
+		out = append(out, record)
+	}
+	return out
+}
+
+func reinterpretKey(deliveryID, rule string) string {
+	return deliveryID + "\x00" + rule
+}
+
 func PayloadSHA(payload []byte) string {
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
@@ -336,6 +471,7 @@ func (s *Store) ingestLocked(raw model.RawMessage, observation *model.Observatio
 	key := sequenceKey(raw.IdentityID, raw.BootID)
 	if existing, ok := s.payloads[key][raw.Sequence]; ok {
 		if existing != PayloadSHA(raw.Payload) {
+			s.recordConflictLocked(raw, existing)
 			return IngestResult{Conflict: true}, fmt.Errorf("sequence %d in boot %s already contains different raw content", raw.Sequence, raw.BootID)
 		}
 		if pending {
@@ -447,6 +583,10 @@ func (s *Store) apply(record JournalRecord) {
 	switch record.Kind {
 	case "ingest":
 		if record.Raw != nil {
+			if _, exists := s.raws[record.Raw.DeliveryID]; !exists {
+				s.rawOrder = append(s.rawOrder, record.Raw.DeliveryID)
+			}
+			s.raws[record.Raw.DeliveryID] = *record.Raw
 			key := sequenceKey(record.Raw.IdentityID, record.Raw.BootID)
 			if s.delivered[key] == nil {
 				s.delivered[key] = make(map[int64]struct{})
@@ -476,9 +616,21 @@ func (s *Store) apply(record JournalRecord) {
 		}
 		if record.Observation != nil {
 			s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
+			if record.Raw != nil {
+				s.obsByDelivery[record.Raw.DeliveryID] = *record.Observation
+			}
 		}
 		if record.Sequence != nil {
 			s.sequences[sequenceKey(record.Sequence.IdentityID, record.Sequence.BootID)] = *record.Sequence
+		}
+	case "reinterpretation":
+		if record.RawRef != nil {
+			s.reinterpreted[reinterpretKey(record.RawRef.DeliveryID, record.Rule)] = struct{}{}
+		}
+		s.reinterpretRecords = append(s.reinterpretRecords, record)
+	case "conflict":
+		if record.Conflict != nil {
+			s.conflicts = append(s.conflicts, *record.Conflict)
 		}
 	case "identity":
 		if record.Identity == nil {
@@ -520,6 +672,9 @@ func (s *Store) applyObservation(record JournalRecord) {
 	}
 	if record.Observation != nil {
 		s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
+		if record.RawRef != nil {
+			s.obsByDelivery[record.RawRef.DeliveryID] = *record.Observation
+		}
 	}
 	if record.Confirmed != nil {
 		key := sequenceKey(record.Confirmed.IdentityID, record.Confirmed.BootID)
@@ -585,9 +740,9 @@ func parseJournal(data []byte) ([]JournalRecord, int, error) {
 }
 
 func observationKey(identityID, observationID string) string {
-	return identityID + "\x00" + observationID
+	return identityID + "\\x00" + observationID
 }
 
 func sequenceKey(identityID, bootID string) string {
-	return identityID + "\x00" + bootID
+	return identityID + "\\x00" + bootID
 }

@@ -36,10 +36,48 @@ type ResumeState struct {
 }
 
 type ReprocessResult struct {
-	Processed []Ack  `json:"processed"`
-	Remaining int    `json:"remaining"`
-	FailedAt  *Ack   `json:"failed_at,omitempty"`
-	Err       string `json:"error,omitempty"`
+	Processed []Ack            `json:"processed"`
+	Remaining int              `json:"remaining"`
+	FailedAt  *Ack             `json:"failed_at,omitempty"`
+	Err       string           `json:"error,omitempty"`
+	Scope     []ReprocessScope `json:"scope,omitempty"`
+}
+
+// ReprocessScope describes the device and sequence/time range covered by a
+// backfill interpretation run over previously unknown formats.
+type ReprocessScope struct {
+	IdentityID    string    `json:"identity_id"`
+	BootID        string    `json:"boot_id"`
+	FromSequence  int64     `json:"from_sequence"`
+	ToSequence    int64     `json:"to_sequence"`
+	FirstReceived time.Time `json:"first_received"`
+	LastReceived  time.Time `json:"last_received"`
+}
+
+// ReinterpretFilter selects stored raw messages for reinterpretation by
+// device identity and receive-time range. Zero values mean no restriction.
+type ReinterpretFilter struct {
+	IdentityID string
+	From       time.Time
+	To         time.Time
+}
+
+type ReinterpretEntry struct {
+	DeliveryID string           `json:"delivery_id"`
+	IdentityID string           `json:"identity_id"`
+	BootID     string           `json:"boot_id"`
+	Sequence   int64            `json:"sequence"`
+	Rule       string           `json:"rule"`
+	Change     string           `json:"change"`
+	Comparison model.Comparison `json:"comparison"`
+}
+
+type ReinterpretReport struct {
+	Rule      string             `json:"rule"`
+	Matched   int                `json:"matched"`
+	Skipped   int                `json:"skipped"` // already reinterpreted with this rule
+	Pending   int                `json:"pending"` // matched but not yet interpretable
+	Processed []ReinterpretEntry `json:"processed"`
 }
 
 type Hub struct {
@@ -254,9 +292,88 @@ func (h *Hub) ReprocessPending() (ReprocessResult, error) {
 			Duplicate:  confirmed.Duplicate,
 		}
 		result.Processed = append(result.Processed, ack)
+		result.Scope = extendScope(result.Scope, raw)
 	}
 	result.Remaining = h.store.PendingCount()
 	return result, nil
+}
+
+func extendScope(scope []ReprocessScope, raw model.RawMessage) []ReprocessScope {
+	for i := range scope {
+		s := &scope[i]
+		if s.IdentityID != raw.IdentityID || s.BootID != raw.BootID {
+			continue
+		}
+		if raw.Sequence < s.FromSequence {
+			s.FromSequence = raw.Sequence
+		}
+		if raw.Sequence > s.ToSequence {
+			s.ToSequence = raw.Sequence
+		}
+		if raw.ReceivedAt.Before(s.FirstReceived) {
+			s.FirstReceived = raw.ReceivedAt
+		}
+		if raw.ReceivedAt.After(s.LastReceived) {
+			s.LastReceived = raw.ReceivedAt
+		}
+		return scope
+	}
+	return append(scope, ReprocessScope{
+		IdentityID:    raw.IdentityID,
+		BootID:        raw.BootID,
+		FromSequence:  raw.Sequence,
+		ToSequence:    raw.Sequence,
+		FirstReceived: raw.ReceivedAt,
+		LastReceived:  raw.ReceivedAt,
+	})
+}
+
+// Reinterpret re-decodes stored raw messages with a corrected rule and
+// records the new observations alongside a comparison against the original
+// interpretation. Original observations are never modified or deleted.
+// Already-reinterpreted deliveries are skipped, so an interrupted run can
+// be resumed by calling Reinterpret again with the same rule.
+func (h *Hub) Reinterpret(rule adapter.Adapter, filter ReinterpretFilter) (ReinterpretReport, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	report := ReinterpretReport{Rule: rule.Type()}
+	raws := h.store.RawMessages(filter.IdentityID, filter.From, filter.To)
+	for _, stored := range raws {
+		report.Matched++
+		if h.store.Reinterpreted(stored.DeliveryID, rule.Type()) {
+			report.Skipped++
+			continue
+		}
+		old, ok := h.store.ObservationFor(stored.DeliveryID)
+		if !ok {
+			// Still pending (unknown format): nothing to compare against yet.
+			report.Pending++
+			continue
+		}
+		observation, err := rule.Decode(stored.RawMessage)
+		if err != nil {
+			return report, fmt.Errorf("reinterpret %s: %w", stored.DeliveryID, err)
+		}
+		comparison := model.Compare(old, observation)
+		if err := h.store.Reinterpret(stored.RawMessage, rule.Type(), observation, comparison); err != nil {
+			return report, err
+		}
+		report.Processed = append(report.Processed, ReinterpretEntry{
+			DeliveryID: stored.DeliveryID,
+			IdentityID: stored.IdentityID,
+			BootID:     stored.BootID,
+			Sequence:   stored.Sequence,
+			Rule:       rule.Type(),
+			Change:     comparison.Change,
+			Comparison: comparison,
+		})
+	}
+	return report, nil
+}
+
+// Conflicts returns the preserved evidence of same-sequence content conflicts.
+func (h *Hub) Conflicts() []store.ConflictEvidence {
+	return h.store.Conflicts()
 }
 
 func pendingAck(raw model.RawMessage) *Ack {
