@@ -34,16 +34,20 @@ func (TemperatureAdapter) Decode(msg model.RawMessage) (model.Observation, error
 		return model.Observation{}, fmt.Errorf("decode temperature time: %w", err)
 	}
 	return model.Observation{
-		ID:         p.ObservationID,
-		IdentityID: msg.IdentityID,
-		HardwareID: msg.HardwareID,
-		Type:       TemperatureType,
-		ObservedAt: observedAt,
-		ReceivedAt: msg.ReceivedAt,
+		ID:            p.ObservationID,
+		IdentityID:    msg.IdentityID,
+		HardwareID:    msg.HardwareID,
+		Type:          TemperatureType,
+		ObservedAt:    observedAt,
+		ReceivedAt:    msg.ReceivedAt,
+		InterpretedAt: msg.ReceivedAt,
+		RuleID:        TemperatureType,
+		Explanation:   "temperature decoded as degrees Celsius",
 		Measures: map[string]float64{
 			"temperature_c": p.Celsius,
 			"humidity_pct":  p.HumidityPct,
 		},
+		Units: map[string]string{"temperature_c": "C", "humidity_pct": "percent"},
 	}, nil
 }
 
@@ -68,16 +72,20 @@ func (TemperatureV2Adapter) Decode(msg model.RawMessage) (model.Observation, err
 		return model.Observation{}, fmt.Errorf("decode temperature v2 time: %w", err)
 	}
 	return model.Observation{
-		ID:         p.ObservationID,
-		IdentityID: msg.IdentityID,
-		HardwareID: msg.HardwareID,
-		Type:       TemperatureV2Type,
-		ObservedAt: observedAt,
-		ReceivedAt: msg.ReceivedAt,
+		ID:            p.ObservationID,
+		IdentityID:    msg.IdentityID,
+		HardwareID:    msg.HardwareID,
+		Type:          TemperatureV2Type,
+		ObservedAt:    observedAt,
+		ReceivedAt:    msg.ReceivedAt,
+		InterpretedAt: msg.ReceivedAt,
+		RuleID:        TemperatureV2Type,
+		Explanation:   "temperature converted from Fahrenheit to degrees Celsius",
 		Measures: map[string]float64{
 			"temperature_c": (p.Fahrenheit - 32) * 5 / 9,
 			"humidity_pct":  p.HumidityPct,
 		},
+		Units: map[string]string{"temperature_c": "C", "humidity_pct": "percent"},
 	}, nil
 }
 

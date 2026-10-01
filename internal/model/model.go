@@ -24,14 +24,19 @@ type RawMessage struct {
 }
 
 type Observation struct {
-	ID         string             `json:"id"`
-	IdentityID string             `json:"identity_id"`
-	HardwareID string             `json:"hardware_id"`
-	Type       string             `json:"type"`
-	ObservedAt time.Time          `json:"observed_at"`
-	ReceivedAt time.Time          `json:"received_at"`
-	Measures   map[string]float64 `json:"measures"`
-	Attributes map[string]any     `json:"attributes,omitempty"`
+	ID            string             `json:"id"`
+	IdentityID    string             `json:"identity_id"`
+	HardwareID    string             `json:"hardware_id"`
+	Type          string             `json:"type"`
+	ObservedAt    time.Time          `json:"observed_at"`
+	ReceivedAt    time.Time          `json:"received_at"`
+	Measures      map[string]float64 `json:"measures"`
+	Attributes    map[string]any     `json:"attributes,omitempty"`
+	Units         map[string]string  `json:"units,omitempty"`
+	Explanation   string             `json:"explanation,omitempty"`
+	RuleID        string             `json:"rule_id,omitempty"`
+	RuleVersion   string             `json:"rule_version,omitempty"`
+	InterpretedAt time.Time          `json:"interpreted_at,omitempty"`
 }
 
 type RawDelivery struct {

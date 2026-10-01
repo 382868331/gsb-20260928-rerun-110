@@ -20,14 +20,16 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type JournalRecord struct {
-	Kind        string                `json:"kind"`
-	Identity    *model.DeviceIdentity `json:"identity,omitempty"`
-	Raw         *StoredRawMessage     `json:"raw,omitempty"`
-	RawRef      *model.RawReference   `json:"raw_ref,omitempty"`
-	Observation *model.Observation    `json:"observation,omitempty"`
-	Sequence    *SequenceProgress     `json:"sequence,omitempty"`
-	Confirmed   *ConfirmedSequence    `json:"confirmed,omitempty"`
-	Checksum    string                `json:"checksum,omitempty"`
+	Kind           string                `json:"kind"`
+	Identity       *model.DeviceIdentity `json:"identity,omitempty"`
+	Raw            *StoredRawMessage     `json:"raw,omitempty"`
+	RawRef         *model.RawReference   `json:"raw_ref,omitempty"`
+	Observation    *model.Observation    `json:"observation,omitempty"`
+	Sequence       *SequenceProgress     `json:"sequence,omitempty"`
+	Confirmed      *ConfirmedSequence    `json:"confirmed,omitempty"`
+	ReinterpretRun *ReinterpretRun       `json:"reinterpret_run,omitempty"`
+	Interpretation *Interpretation       `json:"interpretation,omitempty"`
+	Checksum       string                `json:"checksum,omitempty"`
 }
 
 type StoredRawMessage struct {
@@ -49,20 +51,47 @@ type ConfirmedSequence struct {
 	Last       int64  `json:"last"`
 }
 
+type ReinterpretRun struct {
+	ID             string     `json:"id"`
+	IdentityID     string     `json:"identity_id,omitempty"`
+	BootID         string     `json:"boot_id,omitempty"`
+	Format         string     `json:"format,omitempty"`
+	ReceivedAfter  *time.Time `json:"received_after,omitempty"`
+	ReceivedBefore *time.Time `json:"received_before,omitempty"`
+	IncludePending bool       `json:"include_pending,omitempty"`
+	ScopeNote      string     `json:"scope_note,omitempty"`
+	Status         string     `json:"status"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+}
+
+type Interpretation struct {
+	RunID         string             `json:"run_id"`
+	Raw           model.RawReference `json:"raw"`
+	Observation   model.Observation  `json:"observation"`
+	InterpretedAt time.Time          `json:"interpreted_at"`
+	Backfill      bool               `json:"backfill,omitempty"`
+}
+
 type Store struct {
-	mu         sync.Mutex
-	path       string
-	f          *os.File
-	writer     *bufio.Writer
-	identities map[string]model.DeviceIdentity
-	byHardware map[string]string
-	seenObs    map[string]struct{}
-	sequences  map[string]SequenceProgress
-	delivered  map[string]map[int64]struct{}
-	payloads   map[string]map[int64]string
-	confirmed  map[string]map[int64]struct{}
-	pending    map[string]model.RawMessage
-	pendingIDs []string
+	mu                sync.Mutex
+	path              string
+	f                 *os.File
+	writer            *bufio.Writer
+	identities        map[string]model.DeviceIdentity
+	byHardware        map[string]string
+	seenObs           map[string]struct{}
+	sequences         map[string]SequenceProgress
+	delivered         map[string]map[int64]struct{}
+	payloads          map[string]map[int64]string
+	confirmed         map[string]map[int64]struct{}
+	pending           map[string]model.RawMessage
+	pendingIDs        []string
+	raws              map[string]StoredRawMessage
+	rawIDs            []string
+	baseline          map[string]model.Observation
+	runs              map[string]ReinterpretRun
+	reinterpretations map[string]map[string]Interpretation
 }
 
 func Open(dir string) (*Store, error) {
@@ -75,17 +104,21 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		path:       path,
-		f:          f,
-		writer:     bufio.NewWriter(f),
-		identities: make(map[string]model.DeviceIdentity),
-		byHardware: make(map[string]string),
-		seenObs:    make(map[string]struct{}),
-		sequences:  make(map[string]SequenceProgress),
-		delivered:  make(map[string]map[int64]struct{}),
-		payloads:   make(map[string]map[int64]string),
-		confirmed:  make(map[string]map[int64]struct{}),
-		pending:    make(map[string]model.RawMessage),
+		path:              path,
+		f:                 f,
+		writer:            bufio.NewWriter(f),
+		identities:        make(map[string]model.DeviceIdentity),
+		byHardware:        make(map[string]string),
+		seenObs:           make(map[string]struct{}),
+		sequences:         make(map[string]SequenceProgress),
+		delivered:         make(map[string]map[int64]struct{}),
+		payloads:          make(map[string]map[int64]string),
+		confirmed:         make(map[string]map[int64]struct{}),
+		pending:           make(map[string]model.RawMessage),
+		raws:              make(map[string]StoredRawMessage),
+		baseline:          make(map[string]model.Observation),
+		runs:              make(map[string]ReinterpretRun),
+		reinterpretations: make(map[string]map[string]Interpretation),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -275,12 +308,122 @@ func (s *Store) Pending() []model.RawMessage {
 	return pending
 }
 
+func (s *Store) IsPending(deliveryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.pending[deliveryID]
+	return ok
+}
+
+func (s *Store) RawMessages() []StoredRawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	messages := make([]StoredRawMessage, 0, len(s.rawIDs))
+	seen := make(map[string]struct{}, len(s.rawIDs))
+	for _, id := range s.rawIDs {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if raw, ok := s.raws[id]; ok {
+			messages = append(messages, cloneStoredRaw(raw))
+			seen[id] = struct{}{}
+		}
+	}
+	return messages
+}
+
+func (s *Store) BaselineObservation(deliveryID string) (model.Observation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	observation, ok := s.baseline[deliveryID]
+	return observation, ok
+}
+
+func (s *Store) SaveReinterpretRun(run ReinterpretRun) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.runs[run.ID]; exists {
+		return nil
+	}
+	record := JournalRecord{Kind: "reinterpret_run", ReinterpretRun: &run}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) UpdateReinterpretRun(run ReinterpretRun) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.runs[run.ID]; !exists {
+		return ErrNotFound
+	}
+	record := JournalRecord{Kind: "reinterpret_run", ReinterpretRun: &run}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) GetReinterpretRun(id string) (ReinterpretRun, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[id]
+	return run, ok
+}
+
+func (s *Store) HasInterpretation(runID, deliveryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.reinterpretations[runID][deliveryID]
+	return ok
+}
+
+func (s *Store) StoreInterpretation(interpretation Interpretation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := JournalRecord{Kind: "interpretation", Interpretation: &interpretation}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Interpretations(runID string) []Interpretation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byDelivery := s.reinterpretations[runID]
+	result := make([]Interpretation, 0, len(byDelivery))
+	for _, interpretation := range byDelivery {
+		interpretation.Observation.Measures = cloneMeasures(interpretation.Observation.Measures)
+		result = append(result, interpretation)
+	}
+	return result
+}
+
+func rawOccurrenceID(raw model.RawMessage) string {
+	return raw.DeliveryID + "\x00" + PayloadSHA(raw.Payload)
+}
+
+func interpretationKey(reference model.RawReference) string {
+	return reference.DeliveryID + "\x00" + reference.PayloadSHA
+}
+
 func (s *Store) Confirm(raw model.RawMessage, observation model.Observation) (IngestResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	deliveryKey := sequenceKey(raw.IdentityID, raw.BootID)
 	existingPayload, rawExists := s.payloads[deliveryKey][raw.Sequence]
 	if rawExists && existingPayload != PayloadSHA(raw.Payload) {
+		conflict := StoredRawMessage{RawMessage: raw, Status: "conflict"}
+		conflictRecord := JournalRecord{Kind: "sequence_conflict", Raw: &conflict}
+		if err := s.append(conflictRecord); err != nil {
+			return IngestResult{}, err
+		}
+		s.apply(conflictRecord)
 		return IngestResult{Conflict: true}, fmt.Errorf("sequence %d in boot %s already contains different raw content", raw.Sequence, raw.BootID)
 	}
 	storedRaw, pendingExists := s.pending[raw.DeliveryID]
@@ -336,6 +479,12 @@ func (s *Store) ingestLocked(raw model.RawMessage, observation *model.Observatio
 	key := sequenceKey(raw.IdentityID, raw.BootID)
 	if existing, ok := s.payloads[key][raw.Sequence]; ok {
 		if existing != PayloadSHA(raw.Payload) {
+			conflict := StoredRawMessage{RawMessage: raw, Status: "conflict"}
+			conflictRecord := JournalRecord{Kind: "sequence_conflict", Raw: &conflict}
+			if err := s.append(conflictRecord); err != nil {
+				return IngestResult{}, err
+			}
+			s.apply(conflictRecord)
 			return IngestResult{Conflict: true}, fmt.Errorf("sequence %d in boot %s already contains different raw content", raw.Sequence, raw.BootID)
 		}
 		if pending {
@@ -382,6 +531,22 @@ func (s *Store) ingestLocked(raw model.RawMessage, observation *model.Observatio
 func cloneRaw(raw model.RawMessage) model.RawMessage {
 	raw.Payload = append([]byte(nil), raw.Payload...)
 	return raw
+}
+
+func cloneStoredRaw(raw StoredRawMessage) StoredRawMessage {
+	raw.Payload = append([]byte(nil), raw.Payload...)
+	return raw
+}
+
+func cloneMeasures(measures map[string]float64) map[string]float64 {
+	if measures == nil {
+		return nil
+	}
+	result := make(map[string]float64, len(measures))
+	for name, value := range measures {
+		result[name] = value
+	}
+	return result
 }
 
 func (s *Store) ReadAll() ([]JournalRecord, error) {
@@ -447,6 +612,11 @@ func (s *Store) apply(record JournalRecord) {
 	switch record.Kind {
 	case "ingest":
 		if record.Raw != nil {
+			occurrenceID := rawOccurrenceID(record.Raw.RawMessage)
+			if _, exists := s.raws[occurrenceID]; !exists {
+				s.raws[occurrenceID] = cloneStoredRaw(*record.Raw)
+				s.rawIDs = append(s.rawIDs, occurrenceID)
+			}
 			key := sequenceKey(record.Raw.IdentityID, record.Raw.BootID)
 			if s.delivered[key] == nil {
 				s.delivered[key] = make(map[int64]struct{})
@@ -476,6 +646,9 @@ func (s *Store) apply(record JournalRecord) {
 		}
 		if record.Observation != nil {
 			s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
+			if record.Raw != nil {
+				s.baseline[record.Raw.DeliveryID] = *record.Observation
+			}
 		}
 		if record.Sequence != nil {
 			s.sequences[sequenceKey(record.Sequence.IdentityID, record.Sequence.BootID)] = *record.Sequence
@@ -498,10 +671,44 @@ func (s *Store) apply(record JournalRecord) {
 		s.applyObservation(record)
 	case "duplicate_observation":
 		s.applyObservation(record)
+	case "sequence_conflict":
+		if record.Raw != nil {
+			occurrenceID := rawOccurrenceID(record.Raw.RawMessage)
+			if _, exists := s.raws[occurrenceID]; !exists {
+				s.raws[occurrenceID] = cloneStoredRaw(*record.Raw)
+				s.rawIDs = append(s.rawIDs, occurrenceID)
+			}
+		}
+	case "reinterpret_run":
+		if record.ReinterpretRun != nil {
+			s.runs[record.ReinterpretRun.ID] = *record.ReinterpretRun
+		}
+	case "interpretation":
+		s.applyInterpretation(record)
 	case "sequence":
 		if record.Sequence != nil {
 			s.sequences[sequenceKey(record.Sequence.IdentityID, record.Sequence.BootID)] = *record.Sequence
 		}
+	}
+}
+
+func (s *Store) applyInterpretation(record JournalRecord) {
+	if record.Interpretation == nil {
+		return
+	}
+	interpretation := *record.Interpretation
+	runID := interpretation.RunID
+	if s.reinterpretations[runID] == nil {
+		s.reinterpretations[runID] = make(map[string]Interpretation)
+	}
+	s.reinterpretations[runID][interpretationKey(interpretation.Raw)] = interpretation
+	if interpretation.Backfill {
+		delete(s.pending, interpretation.Raw.DeliveryID)
+		key := sequenceKey(interpretation.Raw.IdentityID, interpretation.Raw.BootID)
+		if s.confirmed[key] == nil {
+			s.confirmed[key] = make(map[int64]struct{})
+		}
+		s.confirmed[key][interpretation.Raw.Sequence] = struct{}{}
 	}
 }
 
@@ -520,6 +727,9 @@ func (s *Store) applyObservation(record JournalRecord) {
 	}
 	if record.Observation != nil {
 		s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
+		if record.RawRef != nil && record.Kind == "observation" {
+			s.baseline[record.RawRef.DeliveryID] = *record.Observation
+		}
 	}
 	if record.Confirmed != nil {
 		key := sequenceKey(record.Confirmed.IdentityID, record.Confirmed.BootID)

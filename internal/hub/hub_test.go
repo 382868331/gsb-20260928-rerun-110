@@ -2,6 +2,7 @@ package hub_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -359,6 +360,245 @@ func TestIdentityReplacementKeepsObservationsSeparate(t *testing.T) {
 		t.Fatalf("same observation ID under new identity must be independently stored: %+v %v", second, err)
 	}
 	_ = first
+}
+
+type correctingTemperatureAdapter struct {
+	factor      float64
+	unit        string
+	explanation string
+}
+
+func (a correctingTemperatureAdapter) Type() string { return "temperature_correctable" }
+
+func (a correctingTemperatureAdapter) Decode(msg model.RawMessage) (model.Observation, error) {
+	var payload device.TemperaturePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return model.Observation{}, err
+	}
+	observedAt, _ := time.Parse(time.RFC3339Nano, payload.ObservedAt)
+	factor := a.factor
+	unit := a.unit
+	if a.explanation == "corrected Celsius value" && payload.ObservationID == "boot-2" {
+		factor = 2
+		unit = "mC"
+	}
+	return model.Observation{
+		ID:         payload.ObservationID,
+		Type:       a.Type(),
+		ObservedAt: observedAt,
+		Measures: map[string]float64{
+			"temperature": payload.Celsius * factor,
+		},
+		Units:       map[string]string{"temperature": unit},
+		Explanation: a.explanation,
+	}, nil
+}
+
+func TestReinterpretPreservesOriginalAndClassifiesDifferences(t *testing.T) {
+	h, s, dir := newHub(t)
+	base := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	h.SetClock(func() time.Time { return base.Add(time.Minute) })
+	if err := h.Provision("temp-1", "hw", "temperature_correctable", base); err != nil {
+		t.Fatal(err)
+	}
+	h.RegisterAdapter(correctingTemperatureAdapter{factor: 2, unit: "mC", explanation: "legacy doubled value"})
+	d := device.NewTemperature("temp-1", "hw", "boot", 1)
+	d.SetFormat("temperature_correctable")
+	changed := d.Reading(base.Add(time.Second), 10, 50)
+	explanationOnly := d.Reading(base.Add(2*time.Second), 20, 50)
+	if _, err := h.Receive("temp-1", changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Receive("temp-1", explanationOnly); err != nil {
+		t.Fatal(err)
+	}
+	h.RegisterAdapter(correctingTemperatureAdapter{factor: 1, unit: "C", explanation: "corrected Celsius value"})
+	end := base.Add(2 * time.Minute)
+	report, err := h.Reinterpret("rule-20261001", hub.ReinterpretSelector{
+		IdentityID:     "temp-1",
+		ReceivedAfter:  &base,
+		ReceivedBefore: &end,
+	})
+	if err != nil || report.Status != "completed" || report.Selected != 2 || len(report.Published) != 2 || report.ScopeNote == "" {
+		t.Fatalf("reinterpret report = %+v, %v", report, err)
+	}
+	differences, err := h.CompareReinterpretation("rule-20261001")
+	if err != nil || len(differences) != 2 {
+		t.Fatalf("differences = %+v, %v", differences, err)
+	}
+	if !containsString(differences[0].Kinds, "value") || !containsString(differences[0].Kinds, "unit") || !containsString(differences[0].Kinds, "explanation") {
+		t.Fatalf("first difference kinds = %v", differences[0].Kinds)
+	}
+	if got := differences[0].ChangedMeasures["temperature"]; got.Old != 20 || got.New != 10 || got.OldUnit != "mC" || got.NewUnit != "C" {
+		t.Fatalf("measure change = %+v", got)
+	}
+	if len(differences[1].Kinds) != 1 || differences[1].Kinds[0] != "explanation" || !differences[1].ExplanationChanged {
+		t.Fatalf("explanation-only difference = %+v", differences[1])
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := hub.New(s2, adapter.NewRegistry())
+	reloadedDifferences, err := h2.CompareReinterpretation("rule-20261001")
+	if err != nil || len(reloadedDifferences) != 2 {
+		t.Fatalf("reloaded differences = %+v, %v", reloadedDifferences, err)
+	}
+	records, err := s2.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var originals, reinterpreted int
+	for _, record := range records {
+		if record.Observation != nil && record.Kind == "ingest" {
+			originals++
+			if record.Observation.Measures["temperature"] == 10 {
+				t.Fatal("original interpretation was overwritten")
+			}
+		}
+		if record.Interpretation != nil {
+			reinterpreted++
+		}
+	}
+	if originals != 2 || reinterpreted != 2 {
+		t.Fatalf("originals=%d reinterpreted=%d", originals, reinterpreted)
+	}
+}
+
+type failingTemperatureAdapter struct {
+	failID string
+}
+
+func (a failingTemperatureAdapter) Type() string { return "temperature_correctable" }
+
+func (a failingTemperatureAdapter) Decode(msg model.RawMessage) (model.Observation, error) {
+	var payload device.TemperaturePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return model.Observation{}, err
+	}
+	if payload.ObservationID == a.failID {
+		return model.Observation{}, fmt.Errorf("rule does not support %s yet", payload.ObservationID)
+	}
+	observedAt, _ := time.Parse(time.RFC3339Nano, payload.ObservedAt)
+	return model.Observation{
+		ID:          payload.ObservationID,
+		Type:        a.Type(),
+		ObservedAt:  observedAt,
+		Measures:    map[string]float64{"temperature": payload.Celsius},
+		Units:       map[string]string{"temperature": "C"},
+		Explanation: "supported after adapter update",
+	}, nil
+}
+
+func TestReinterpretResumesWithoutDuplicates(t *testing.T) {
+	h, _, _ := newHub(t)
+	now := time.Now().UTC()
+	if err := h.Provision("temp-1", "hw", "temperature_correctable", now); err != nil {
+		t.Fatal(err)
+	}
+	h.RegisterAdapter(correctingTemperatureAdapter{factor: 2, unit: "mC", explanation: "old"})
+	d := device.NewTemperature("temp-1", "hw", "boot", 1)
+	d.SetFormat("temperature_correctable")
+	first := d.Reading(now.Add(time.Second), 10, 50)
+	second := d.Reading(now.Add(2*time.Second), 11, 50)
+	if _, err := h.Receive("temp-1", first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Receive("temp-1", second); err != nil {
+		t.Fatal(err)
+	}
+	h.RegisterAdapter(failingTemperatureAdapter{failID: "boot-2"})
+	report, err := h.Reinterpret("resume-1", hub.ReinterpretSelector{IdentityID: "temp-1"})
+	if err != nil || report.Status != "running" || len(report.Published) != 1 || report.Remaining != 1 || report.FailedAt == nil {
+		t.Fatalf("interrupted report = %+v, %v", report, err)
+	}
+	h.RegisterAdapter(failingTemperatureAdapter{})
+	report, err = h.Reinterpret("resume-1", hub.ReinterpretSelector{IdentityID: "temp-1"})
+	if err != nil || report.Status != "completed" || len(report.Published) != 1 || len(report.AlreadyDone) != 1 {
+		t.Fatalf("resumed report = %+v, %v", report, err)
+	}
+	differences, err := h.CompareReinterpretation("resume-1")
+	if err != nil || len(differences) != 2 {
+		t.Fatalf("resumed differences = %+v, %v", differences, err)
+	}
+}
+
+func TestReinterpretBackfillsPendingWithScopedEvidence(t *testing.T) {
+	h, _, _ := newHub(t)
+	now := time.Now().UTC()
+	if err := h.Provision("temp-1", "hw", "future-temperature", now); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"observation_id": "future-1",
+		"observed_at":    now.Add(time.Second).Format(time.RFC3339Nano),
+		"temp_c":         18.5,
+		"humidity_pct":   55,
+	})
+	delivery := model.RawDelivery{BootID: "boot", Sequence: 7, Format: "future-temperature", ContentType: "application/json", Payload: payload}
+	if _, err := h.Receive("temp-1", delivery); err != nil {
+		t.Fatal(err)
+	}
+	h.RegisterAdapter(futureAdapter{format: "future-temperature"})
+	report, err := h.Reinterpret("backfill-1", hub.ReinterpretSelector{IdentityID: "temp-1", IncludePending: true})
+	if err != nil || report.Status != "completed" || len(report.Published) != 1 || !report.Published[0].Backfill {
+		t.Fatalf("backfill report = %+v, %v", report, err)
+	}
+	differences, err := h.CompareReinterpretation("backfill-1")
+	if err != nil || len(differences) != 1 || differences[0].Kinds[0] != "backfilled" {
+		t.Fatalf("backfill differences = %+v, %v", differences, err)
+	}
+}
+
+func TestSequenceConflictRetainsBothPayloadsAndRebootsStaySeparate(t *testing.T) {
+	h, s, _ := newHub(t)
+	now := time.Now().UTC()
+	if err := h.Provision("temp-1", "hw", device.TemperatureType, now); err != nil {
+		t.Fatal(err)
+	}
+	d := device.NewTemperature("temp-1", "hw", "boot-a", 1)
+	first := d.Reading(now.Add(time.Second), 10, 50)
+	if _, err := h.Receive("temp-1", first); err != nil {
+		t.Fatal(err)
+	}
+	conflict := d.Reading(now.Add(2*time.Second), 11, 50)
+	conflict.Sequence = 1
+	if _, err := h.Receive("temp-1", conflict); err == nil {
+		t.Fatal("same boot and sequence conflict must be rejected")
+	}
+	d.Reboot("boot-b", 1)
+	reused := d.Reading(now.Add(3*time.Second), 12, 50)
+	if _, err := h.Receive("temp-1", reused); err != nil {
+		t.Fatalf("same sequence in a new boot must be accepted: %v", err)
+	}
+	records, err := s.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflicts, confirmed int
+	for _, record := range records {
+		if record.Kind == "sequence_conflict" {
+			conflicts++
+		}
+		if record.Raw != nil && record.Raw.Status == "confirmed" {
+			confirmed++
+		}
+	}
+	if conflicts != 1 || confirmed != 2 {
+		t.Fatalf("conflicts=%d confirmed=%d", conflicts, confirmed)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTornTailRecordIsNotCompleted(t *testing.T) {

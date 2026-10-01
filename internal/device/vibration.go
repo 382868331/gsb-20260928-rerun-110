@@ -41,13 +41,22 @@ func (VibrationAdapter) Decode(msg model.RawMessage) (model.Observation, error) 
 	}
 	values["rms_g"] = rms
 	return model.Observation{
-		ID:         row[0],
-		IdentityID: msg.IdentityID,
-		HardwareID: msg.HardwareID,
-		Type:       VibrationType,
-		ObservedAt: observedAt,
-		ReceivedAt: msg.ReceivedAt,
-		Measures:   values,
+		ID:            row[0],
+		IdentityID:    msg.IdentityID,
+		HardwareID:    msg.HardwareID,
+		Type:          VibrationType,
+		ObservedAt:    observedAt,
+		ReceivedAt:    msg.ReceivedAt,
+		InterpretedAt: msg.ReceivedAt,
+		RuleID:        VibrationType,
+		Explanation:   "vibration decoded as acceleration and RMS in g",
+		Measures:      values,
+		Units: map[string]string{
+			"axis_x_g": "g",
+			"axis_y_g": "g",
+			"axis_z_g": "g",
+			"rms_g":    "g",
+		},
 	}, nil
 }
 
