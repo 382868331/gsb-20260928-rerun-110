@@ -20,17 +20,21 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type JournalRecord struct {
-	Kind        string                `json:"kind"`
-	Identity    *model.DeviceIdentity `json:"identity,omitempty"`
-	Raw         *StoredRawMessage     `json:"raw,omitempty"`
-	RawRef      *model.RawReference   `json:"raw_ref,omitempty"`
-	Observation *model.Observation    `json:"observation,omitempty"`
-	Sequence    *SequenceProgress     `json:"sequence,omitempty"`
-	Confirmed   *ConfirmedSequence    `json:"confirmed,omitempty"`
-	Rule        string                `json:"rule,omitempty"`
-	Comparison  *model.Comparison     `json:"comparison,omitempty"`
-	Conflict    *ConflictEvidence     `json:"conflict,omitempty"`
-	Checksum    string                `json:"checksum,omitempty"`
+	Kind        string                  `json:"kind"`
+	Identity    *model.DeviceIdentity   `json:"identity,omitempty"`
+	Raw         *StoredRawMessage       `json:"raw,omitempty"`
+	RawRef      *model.RawReference     `json:"raw_ref,omitempty"`
+	Observation *model.Observation      `json:"observation,omitempty"`
+	Sequence    *SequenceProgress       `json:"sequence,omitempty"`
+	Confirmed   *ConfirmedSequence      `json:"confirmed,omitempty"`
+	Rule        string                  `json:"rule,omitempty"`
+	Comparison  *model.Comparison       `json:"comparison,omitempty"`
+	Conflict    *ConflictEvidence       `json:"conflict,omitempty"`
+	Branch      *model.CorrectionBranch `json:"branch,omitempty"`
+	Adoption    *model.Adoption         `json:"adoption,omitempty"`
+	Retraction  *model.Retraction       `json:"retraction,omitempty"`
+	Downstream  *model.DownstreamRef    `json:"downstream,omitempty"`
+	Checksum    string                  `json:"checksum,omitempty"`
 }
 
 // ConflictEvidence preserves both sides of a same-sequence conflict:
@@ -80,6 +84,12 @@ type Store struct {
 	reinterpreted      map[string]struct{}
 	reinterpretRecords []JournalRecord
 	conflicts          []ConflictEvidence
+	branches           map[string]model.CorrectionBranch
+	branchOrder        []string
+	adoptions          map[string]model.Adoption
+	interpStack        map[string][]interpState
+	downstream         []model.DownstreamRef
+	revision           int64
 }
 
 func Open(dir string) (*Store, error) {
@@ -106,6 +116,9 @@ func Open(dir string) (*Store, error) {
 		raws:          make(map[string]StoredRawMessage),
 		obsByDelivery: make(map[string]model.Observation),
 		reinterpreted: make(map[string]struct{}),
+		branches:      make(map[string]model.CorrectionBranch),
+		adoptions:     make(map[string]model.Adoption),
+		interpStack:   make(map[string][]interpState),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -632,6 +645,36 @@ func (s *Store) apply(record JournalRecord) {
 		if record.Conflict != nil {
 			s.conflicts = append(s.conflicts, *record.Conflict)
 		}
+	case "correction_branch":
+		s.applyBranch(record.Branch)
+	case "adoption":
+		s.applyBranch(record.Branch)
+		if record.Adoption != nil {
+			s.adoptions[record.Adoption.ID] = *record.Adoption
+			if record.Adoption.Revision > s.revision {
+				s.revision = record.Adoption.Revision
+			}
+			for _, entry := range record.Adoption.Entries {
+				deliveryID := entry.RawRef.DeliveryID
+				s.interpStack[deliveryID] = append(s.interpStack[deliveryID], interpState{Rule: record.Adoption.Rule, AdoptionID: record.Adoption.ID})
+			}
+		}
+	case "retraction":
+		if record.Retraction != nil {
+			if record.Retraction.Revision > s.revision {
+				s.revision = record.Retraction.Revision
+			}
+			for _, deliveryID := range record.Retraction.DeliveryIDs {
+				stack := s.interpStack[deliveryID]
+				if n := len(stack); n > 0 && stack[n-1].AdoptionID == record.Retraction.AdoptionID {
+					s.interpStack[deliveryID] = stack[:n-1]
+				}
+			}
+		}
+	case "downstream_ref":
+		if record.Downstream != nil {
+			s.downstream = append(s.downstream, *record.Downstream)
+		}
 	case "identity":
 		if record.Identity == nil {
 			return
@@ -655,6 +698,16 @@ func (s *Store) apply(record JournalRecord) {
 			s.sequences[sequenceKey(record.Sequence.IdentityID, record.Sequence.BootID)] = *record.Sequence
 		}
 	}
+}
+
+func (s *Store) applyBranch(branch *model.CorrectionBranch) {
+	if branch == nil {
+		return
+	}
+	if _, exists := s.branches[branch.ID]; !exists {
+		s.branchOrder = append(s.branchOrder, branch.ID)
+	}
+	s.branches[branch.ID] = *branch
 }
 
 func (s *Store) applyObservation(record JournalRecord) {

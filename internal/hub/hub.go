@@ -84,11 +84,12 @@ type Hub struct {
 	mu       sync.Mutex
 	store    *store.Store
 	adapters *adapter.Registry
+	rules    map[string]adapter.Adapter
 	now      func() time.Time
 }
 
 func New(s *store.Store, adapters *adapter.Registry) *Hub {
-	return &Hub{store: s, adapters: adapters, now: time.Now}
+	return &Hub{store: s, adapters: adapters, rules: make(map[string]adapter.Adapter), now: time.Now}
 }
 
 func (h *Hub) SetClock(now func() time.Time) {
