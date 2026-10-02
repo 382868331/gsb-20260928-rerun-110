@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -730,5 +731,189 @@ func TestReprocessPendingReportsScope(t *testing.T) {
 	}
 	if !scope.FirstReceived.Equal(base) || !scope.LastReceived.Equal(base.Add(time.Minute)) {
 		t.Fatalf("scope time range = %+v", scope)
+	}
+}
+
+func TestCorrectionBranchesAdoptionAuditWithdrawalAndRestart(t *testing.T) {
+	h, s, dir := newHub(t)
+	base := time.Date(2026, 10, 1, 8, 0, 0, 0, time.UTC)
+	clock := base
+	h.SetClock(func() time.Time { return clock })
+	if err := h.Provision("temp-1", "hw-1", device.TemperatureType, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Provision("temp-2", "hw-2", device.TemperatureType, base); err != nil {
+		t.Fatal(err)
+	}
+	d1 := device.NewTemperature("temp-1", "hw-1", "boot-1", 1)
+	d2 := device.NewTemperature("temp-2", "hw-2", "boot-1", 1)
+	clock = base.Add(time.Minute)
+	if _, err := h.Receive("temp-1", d1.Reading(clock, 10, 40)); err != nil {
+		t.Fatal(err)
+	}
+	clock = base.Add(2 * time.Minute)
+	if _, err := h.Receive("temp-1", d1.Reading(clock, 11, 41)); err != nil {
+		t.Fatal(err)
+	}
+	clock = base.Add(3 * time.Minute)
+	if _, err := h.Receive("temp-2", d2.Reading(clock, 12, 42)); err != nil {
+		t.Fatal(err)
+	}
+	unknownPayload, _ := json.Marshal(map[string]any{
+		"observation_id": "unknown-1",
+		"observed_at":    base.Add(4 * time.Minute).Format(time.RFC3339Nano),
+		"temp_c":         18,
+		"humidity_pct":   44,
+	})
+	clock = base.Add(4 * time.Minute)
+	unknown := model.RawDelivery{BootID: "boot-1", Sequence: 3, Format: "future-x", ContentType: "application/json", Payload: unknownPayload}
+	ack, err := h.Receive("temp-1", unknown)
+	if err != nil || !ack.Pending {
+		t.Fatalf("unknown delivery = %+v, %v", ack, err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var buildErr error
+	go func() {
+		defer wg.Done()
+		_, err := h.CreateCorrectionBranch(hub.CorrectionRequest{
+			ID: "fahrenheit", Rule: unitChangeRule{}, Operator: "alice",
+			Reason: "site reports imperial unit", Scope: model.BranchScope{IdentityID: "temp-1", ToSequence: 2},
+		})
+		if err != nil {
+			buildErr = err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := h.CreateCorrectionBranch(hub.CorrectionRequest{
+			ID: "calibration", Rule: correctedTempRule{}, Operator: "bob",
+			Reason: "sensor offset", Scope: model.BranchScope{ToSequence: 2},
+		})
+		if err != nil {
+			buildErr = err
+		}
+	}()
+	wg.Wait()
+	if buildErr != nil {
+		t.Fatal(buildErr)
+	}
+	unknownBuild, err := h.CreateCorrectionBranch(hub.CorrectionRequest{
+		ID: "explain-future", Rule: futureAdapter{format: "future-x"}, Operator: "alice",
+		Scope: model.BranchScope{IdentityID: "temp-1", BootID: "boot-1", FromSequence: 3, ToSequence: 3},
+	})
+	if err != nil || len(unknownBuild.Processed) != 1 || unknownBuild.Pending != 1 {
+		t.Fatalf("unknown build = %+v, %v", unknownBuild, err)
+	}
+	referenceChanged, err := h.RegisterDownstreamReference(hub.ReferenceRequest{
+		ID: "dashboard-changed", Name: "changed dashboard",
+		DeliveryIDs: []string{"temp-1:boot-1:1", "temp-1:boot-1:2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(h.BranchEntries("fahrenheit")) != 2 {
+		t.Fatalf("fahrenheit entries = %d", len(h.BranchEntries("fahrenheit")))
+	}
+	fAdopted, err := h.AdoptBranch(hub.AdoptionRequest{BranchID: "fahrenheit", Operator: "reviewer", Reason: "officially imperial"})
+	if err != nil || fAdopted.Adoption == nil || len(fAdopted.Adopted) != 2 {
+		t.Fatalf("adopt fahrenheit = %+v, %v", fAdopted, err)
+	}
+	overlap, err := h.AdoptBranch(hub.AdoptionRequest{BranchID: "calibration", Operator: "reviewer", Scope: model.BranchScope{IdentityID: "temp-1"}})
+	if err != nil || len(overlap.Conflicts) != 2 || overlap.Adoption != nil {
+		t.Fatalf("overlap adoption = %+v, %v", overlap, err)
+	}
+	if overlap.Conflicts[0].Reason != "incompatible unit interpretation" {
+		t.Fatalf("conflict reason = %s", overlap.Conflicts[0].Reason)
+	}
+	narrowed, err := h.AdoptBranch(hub.AdoptionRequest{
+		BranchID: "calibration", Operator: "reviewer",
+		Scope: model.BranchScope{IdentityID: "temp-2"},
+	})
+	if err != nil || len(narrowed.Adopted) != 1 || narrowed.Adopted[0].RawRef.IdentityID != "temp-2" {
+		t.Fatalf("narrowed adoption = %+v, %v", narrowed, err)
+	}
+	futureAdopted, err := h.AdoptBranch(hub.AdoptionRequest{BranchID: "explain-future", Operator: "reviewer"})
+	if err != nil || futureAdopted.Adoption == nil {
+		t.Fatalf("future adoption = %+v, %v", futureAdopted, err)
+	}
+	if err := h.AbandonBranch("unused", "operator", "not needed"); err == nil {
+		t.Fatal("missing branch must not be abandoned")
+	}
+
+	referenceValid, err := h.RegisterDownstreamReference(hub.ReferenceRequest{
+		ID: "dashboard-valid", Name: "new dashboard",
+		DeliveryIDs: []string{"temp-1:boot-1:3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impacts := h.AuditReferences()
+	impactByID := map[string]model.ReferenceImpact{}
+	for _, impact := range impacts {
+		impactByID[impact.ReferenceID] = impact
+	}
+	if impactByID[referenceChanged.ID].Status != model.ReferenceReview || len(impactByID[referenceChanged.ID].DeliveryIDs) != 2 {
+		t.Fatalf("changed impact = %+v", impactByID[referenceChanged.ID])
+	}
+	if impactByID[referenceValid.ID].Status != model.ReferenceValid {
+		t.Fatalf("valid impact = %+v", impactByID[referenceValid.ID])
+	}
+
+	withdrawal, err := h.WithdrawAdoption(fAdopted.Adoption.ID, "reviewer", "first reading needs original", model.BranchScope{
+		IdentityID: "temp-1", FromSequence: 1, ToSequence: 1,
+	})
+	if err != nil || len(withdrawal.DeliveryIDs) != 1 {
+		t.Fatalf("withdrawal = %+v, %v", withdrawal, err)
+	}
+	current1, ok := h.CurrentValue("temp-1:boot-1:1")
+	if !ok || current1.Source != "original" || !current1.Withdrawn || current1.Observation.Measures["temperature_c"] != 10 {
+		t.Fatalf("withdrawn current = %+v ok=%v", current1, ok)
+	}
+	current2, ok := h.CurrentValue("temp-1:boot-1:2")
+	if !ok || current2.Source != "branch" || current2.BranchID != "fahrenheit" || current2.Observation.Measures["temperature_f"] == 0 {
+		t.Fatalf("remaining adopted current = %+v ok=%v", current2, ok)
+	}
+	current3, ok := h.CurrentValue("temp-1:boot-1:3")
+	if !ok || current3.Source != "branch" || current3.AdoptionID == "" || current3.RawRef.PayloadSHA == "" {
+		t.Fatalf("unknown current trace = %+v ok=%v", current3, ok)
+	}
+	if impact := impactByID[referenceChanged.ID]; len(impact.DeliveryIDs) != 2 {
+		t.Fatalf("adoption snapshot changed: %+v", impact)
+	}
+	postWithdrawal := h.AuditReferences()
+	for _, impact := range postWithdrawal {
+		if impact.ReferenceID == referenceChanged.ID && impact.Status != model.ReferenceReview {
+			t.Fatalf("post-withdrawal impact = %+v", impact)
+		}
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := hub.New(s2, adapter.NewRegistry(device.TemperatureAdapter{}))
+	restart1, ok := h2.CurrentValue("temp-1:boot-1:1")
+	if !ok || restart1.Source != "original" || !restart1.Withdrawn || restart1.RawRef.DeliveryID != "temp-1:boot-1:1" {
+		t.Fatalf("restart current1 = %+v ok=%v", restart1, ok)
+	}
+	restart2, ok := h2.CurrentValue("temp-1:boot-1:2")
+	if !ok || restart2.Source != "branch" || restart2.BranchID != "fahrenheit" || restart2.AdoptionID == "" {
+		t.Fatalf("restart current2 = %+v ok=%v", restart2, ok)
+	}
+	if len(h2.BranchConflicts()) != 2 {
+		t.Fatalf("restart branch conflicts = %+v", h2.BranchConflicts())
+	}
+	resumedBuild, err := h2.CreateCorrectionBranch(hub.CorrectionRequest{
+		ID: "explain-future", Rule: futureAdapter{format: "future-x"}, Operator: "alice",
+		Scope: model.BranchScope{IdentityID: "temp-1", BootID: "boot-1", FromSequence: 3, ToSequence: 3},
+	})
+	if err != nil || resumedBuild.Matched != 1 || resumedBuild.Skipped != 1 || len(resumedBuild.Processed) != 0 {
+		t.Fatalf("resumed unknown branch = %+v, %v", resumedBuild, err)
 	}
 }

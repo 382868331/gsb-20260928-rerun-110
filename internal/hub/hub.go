@@ -3,6 +3,8 @@ package hub
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -78,6 +80,58 @@ type ReinterpretReport struct {
 	Skipped   int                `json:"skipped"` // already reinterpreted with this rule
 	Pending   int                `json:"pending"` // matched but not yet interpretable
 	Processed []ReinterpretEntry `json:"processed"`
+}
+
+type CorrectionRequest struct {
+	ID       string
+	Rule     adapter.Adapter
+	Operator string
+	Reason   string
+	Scope    model.BranchScope
+}
+
+type BranchBuildReport struct {
+	BranchID  string              `json:"branch_id"`
+	Rule      string              `json:"rule"`
+	Matched   int                 `json:"matched"`
+	Processed []model.BranchEntry `json:"processed"`
+	Pending   int                 `json:"pending"`
+	Skipped   int                 `json:"skipped"`
+}
+
+type AdoptionRequest struct {
+	BranchID string
+	Operator string
+	Reason   string
+	Scope    model.BranchScope
+}
+
+type AdoptionConflict struct {
+	DeliveryID         string `json:"delivery_id"`
+	ExistingBranchID   string `json:"existing_branch_id"`
+	ExistingAdoptionID string `json:"existing_adoption_id"`
+	Reason             string `json:"reason"`
+}
+
+type AdoptionResult struct {
+	Adoption  *model.Adoption     `json:"adoption,omitempty"`
+	Adopted   []model.BranchEntry `json:"adopted,omitempty"`
+	Conflicts []AdoptionConflict  `json:"conflicts,omitempty"`
+}
+
+type ReferenceRequest struct {
+	ID          string
+	Name        string
+	Operator    string
+	DeliveryIDs []string
+	Baseline    map[string]string
+}
+
+type BranchComparisonEntry struct {
+	DeliveryID string             `json:"delivery_id"`
+	RawRef     model.RawReference `json:"raw_ref"`
+	Change     string             `json:"change"`
+	Comparison model.Comparison   `json:"comparison"`
 }
 
 type Hub struct {
@@ -369,6 +423,340 @@ func (h *Hub) Reinterpret(rule adapter.Adapter, filter ReinterpretFilter) (Reint
 		})
 	}
 	return report, nil
+}
+
+// CreateCorrectionBranch materializes a correction as an independently
+// comparable branch without changing any current value. Re-running with the
+// same branch ID resumes an interrupted run and skips durable entries.
+func (h *Hub) CreateCorrectionBranch(req CorrectionRequest) (BranchBuildReport, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if req.Rule == nil {
+		return BranchBuildReport{}, errors.New("correction rule is required")
+	}
+	now := h.now().UTC()
+	branchID := req.ID
+	if branchID == "" {
+		branchID = req.Rule.Type() + "-" + strconv.FormatInt(now.UnixNano(), 36)
+	}
+	branch, exists := h.store.Branch(branchID)
+	if !exists {
+		branch = model.CorrectionBranch{
+			ID: branchID, Rule: req.Rule.Type(), Operator: req.Operator,
+			Reason: req.Reason, Scope: req.Scope, Status: model.BranchActive,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := h.store.SaveBranch(branch); err != nil {
+			return BranchBuildReport{}, err
+		}
+	} else if branch.Rule != req.Rule.Type() {
+		return BranchBuildReport{}, fmt.Errorf("branch %s already uses rule %s", branchID, branch.Rule)
+	}
+	report := BranchBuildReport{BranchID: branchID, Rule: req.Rule.Type()}
+	for _, stored := range h.store.RawMessages(req.Scope.IdentityID, req.Scope.From, req.Scope.To) {
+		if !req.Scope.Matches(stored.IdentityID, stored.BootID, stored.Sequence, stored.ReceivedAt) {
+			continue
+		}
+		report.Matched++
+		if h.store.BranchEntryExists(branchID, stored.DeliveryID) {
+			report.Skipped++
+			continue
+		}
+		newObservation, err := req.Rule.Decode(stored.RawMessage)
+		if err != nil {
+			return report, fmt.Errorf("build branch %s for %s: %w", branchID, stored.DeliveryID, err)
+		}
+		oldObservation, hasOld := h.store.ObservationFor(stored.DeliveryID)
+		comparison := model.Comparison{Change: model.ChangeValue}
+		if hasOld {
+			comparison = model.Compare(oldObservation, newObservation)
+		}
+		entry := model.BranchEntry{
+			ID:       branchID + ":" + stored.DeliveryID,
+			BranchID: branchID, Rule: req.Rule.Type(),
+			RawRef: stored.RawReference(), Observation: newObservation,
+			Comparison: comparison, Status: model.EntryIncluded,
+			CreatedAt: now,
+		}
+		if !hasOld {
+			report.Pending++
+		}
+		if err := h.store.SaveBranchEntry(entry); err != nil {
+			return report, err
+		}
+		report.Processed = append(report.Processed, entry)
+	}
+	return report, nil
+}
+
+func (h *Hub) Branches() []model.CorrectionBranch { return h.store.Branches() }
+
+func (h *Hub) BranchEntries(branchID string) []model.BranchEntry {
+	return h.store.BranchEntries(branchID)
+}
+
+// CompareBranches compares candidate interpretations for the same stored
+// deliveries. Scope can select different devices, boots, sequences or time
+// windows; only deliveries present in both branches are compared.
+func (h *Hub) CompareBranches(leftID, rightID string, scope model.BranchScope) ([]BranchComparisonEntry, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.store.Branch(leftID); !ok {
+		return nil, fmt.Errorf("branch %s not found", leftID)
+	}
+	if _, ok := h.store.Branch(rightID); !ok {
+		return nil, fmt.Errorf("branch %s not found", rightID)
+	}
+	left := map[string]model.BranchEntry{}
+	for _, entry := range h.store.BranchEntries(leftID) {
+		if scope.Matches(entry.RawRef.IdentityID, entry.RawRef.BootID, entry.RawRef.Sequence, entry.Observation.ReceivedAt) {
+			left[entry.RawRef.DeliveryID] = entry
+		}
+	}
+	var out []BranchComparisonEntry
+	for _, rightEntry := range h.store.BranchEntries(rightID) {
+		ref := rightEntry.RawRef
+		if !scope.Matches(ref.IdentityID, ref.BootID, ref.Sequence, rightEntry.Observation.ReceivedAt) {
+			continue
+		}
+		leftEntry, ok := left[ref.DeliveryID]
+		if !ok {
+			continue
+		}
+		comparison := model.Compare(leftEntry.Observation, rightEntry.Observation)
+		out = append(out, BranchComparisonEntry{
+			DeliveryID: ref.DeliveryID, RawRef: ref,
+			Change: comparison.Change, Comparison: comparison,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].DeliveryID < out[j].DeliveryID })
+	return out, nil
+}
+
+// AdoptBranch makes non-overlapping branch entries current. Any overlap with
+// a different active adoption is returned and excluded, so callers can narrow
+// the scope and adopt the remaining compatible subset.
+func (h *Hub) AdoptBranch(req AdoptionRequest) (AdoptionResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	branch, ok := h.store.Branch(req.BranchID)
+	if !ok {
+		return AdoptionResult{}, fmt.Errorf("branch %s not found", req.BranchID)
+	}
+	if branch.Status == model.BranchAbandoned {
+		return AdoptionResult{}, fmt.Errorf("branch %s was abandoned", req.BranchID)
+	}
+	result := AdoptionResult{}
+	var candidates []model.BranchEntry
+	for _, entry := range h.store.BranchEntries(req.BranchID) {
+		if entry.Status == model.EntryExcluded {
+			continue
+		}
+		ref := entry.RawRef
+		if !req.Scope.Matches(ref.IdentityID, ref.BootID, ref.Sequence, entry.Observation.ReceivedAt) {
+			continue
+		}
+		if existing, exists := h.store.CurrentAdoption(ref.DeliveryID); exists {
+			if h.store.Withdrawn(existing.ID, ref.DeliveryID) {
+				candidates = append(candidates, entry)
+				continue
+			}
+			if existing.BranchID == req.BranchID {
+				continue
+			}
+			conflict := AdoptionConflict{
+				DeliveryID: ref.DeliveryID, ExistingBranchID: existing.BranchID,
+				ExistingAdoptionID: existing.ID,
+				Reason:             "overlapping active adoption",
+			}
+			current, _ := h.store.CurrentValue(ref.DeliveryID)
+			if unitConflict(current.Observation, entry.Observation) {
+				conflict.Reason = "incompatible unit interpretation"
+			}
+			result.Conflicts = append(result.Conflicts, conflict)
+			if err := h.store.RecordBranchConflict(model.BranchConflict{
+				BranchID: req.BranchID, ExistingBranchID: existing.BranchID,
+				DeliveryIDs: []string{ref.DeliveryID}, Reason: conflict.Reason,
+				RecordedAt: h.now().UTC(),
+			}); err != nil {
+				return AdoptionResult{}, err
+			}
+			continue
+		}
+		candidates = append(candidates, entry)
+	}
+	if len(result.Conflicts) != 0 {
+		return result, nil
+	}
+	if len(candidates) == 0 {
+		return AdoptionResult{}, nil
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].RawRef.DeliveryID < candidates[j].RawRef.DeliveryID })
+	deliveryIDs := make([]string, 0, len(candidates))
+	for _, entry := range candidates {
+		deliveryIDs = append(deliveryIDs, entry.RawRef.DeliveryID)
+	}
+	adoption := model.Adoption{
+		ID:       req.BranchID + ":adopt:" + strconv.FormatInt(h.now().UTC().UnixNano(), 36),
+		BranchID: req.BranchID, Rule: branch.Rule, Operator: req.Operator,
+		Reason: req.Reason, Scope: req.Scope, DeliveryIDs: deliveryIDs,
+		AdoptedAt: h.now().UTC(),
+	}
+	adoption.References = h.referenceImpactsLocked(deliveryIDs)
+	if err := h.store.Adopt(adoption); err != nil {
+		return AdoptionResult{}, err
+	}
+	updated := branch
+	updated.Status = model.BranchAdopted
+	updated.UpdatedAt = adoption.AdoptedAt
+	_ = h.store.UpdateBranch(updated)
+	result.Adoption = &adoption
+	result.Adopted = candidates
+	return result, nil
+}
+
+func unitConflict(oldObs, candidate model.Observation) bool {
+	oldUnits := map[string]string{}
+	for name := range oldObs.Measures {
+		base, unit := model.SplitMeasureName(name)
+		if unit != "" {
+			oldUnits[base] = unit
+		}
+	}
+	for name := range candidate.Measures {
+		base, unit := model.SplitMeasureName(name)
+		if unit != "" && oldUnits[base] != "" && oldUnits[base] != unit {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hub) AbandonBranch(branchID, operator, reason string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	branch, ok := h.store.Branch(branchID)
+	if !ok {
+		return fmt.Errorf("branch %s not found", branchID)
+	}
+	branch.Status = model.BranchAbandoned
+	branch.AbandonReason = reason
+	branch.Operator = operator
+	branch.UpdatedAt = h.now().UTC()
+	return h.store.UpdateBranch(branch)
+}
+
+func (h *Hub) WithdrawAdoption(adoptionID, operator, reason string, scope model.BranchScope) (model.AdoptionWithdrawal, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	adoption, ok := h.store.Adoption(adoptionID)
+	if !ok {
+		return model.AdoptionWithdrawal{}, fmt.Errorf("adoption %s not found", adoptionID)
+	}
+	var ids []string
+	for _, id := range adoption.DeliveryIDs {
+		if current, exists := h.store.CurrentValue(id); exists && current.AdoptionID == adoptionID && scope.Matches(current.RawRef.IdentityID, current.RawRef.BootID, current.RawRef.Sequence, current.Observation.ReceivedAt) {
+			ids = append(ids, id)
+		}
+	}
+	withdrawal := model.AdoptionWithdrawal{
+		ID:         adoptionID + ":withdraw:" + strconv.FormatInt(h.now().UTC().UnixNano(), 36),
+		AdoptionID: adoptionID, BranchID: adoption.BranchID, Operator: operator,
+		Reason: reason, DeliveryIDs: ids, WithdrawnAt: h.now().UTC(),
+	}
+	if err := h.store.WithdrawAdoption(withdrawal); err != nil {
+		return model.AdoptionWithdrawal{}, err
+	}
+	return withdrawal, nil
+}
+
+func (h *Hub) RegisterDownstreamReference(req ReferenceRequest) (model.DownstreamReference, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	deliveryIDs := append([]string(nil), req.DeliveryIDs...)
+	sort.Strings(deliveryIDs)
+	baseline := map[string]string{}
+	for key, value := range req.Baseline {
+		baseline[key] = value
+	}
+	for _, deliveryID := range deliveryIDs {
+		if _, known := baseline[deliveryID]; !known {
+			if current, ok := h.store.CurrentValue(deliveryID); ok {
+				baseline[deliveryID] = model.Fingerprint(current.Observation)
+			}
+		}
+	}
+	id := req.ID
+	if id == "" {
+		id = "ref-" + strconv.FormatInt(h.now().UTC().UnixNano(), 36)
+	}
+	reference := model.DownstreamReference{
+		ID: id, Name: req.Name, Operator: req.Operator,
+		DeliveryIDs: deliveryIDs, Baseline: baseline, CreatedAt: h.now().UTC(),
+	}
+	return reference, h.store.RegisterReference(reference)
+}
+
+func (h *Hub) AuditReferences() []model.ReferenceImpact {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	all := map[string]struct{}{}
+	for _, reference := range h.store.References() {
+		for _, id := range reference.DeliveryIDs {
+			all[id] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(all))
+	for id := range all {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return h.referenceImpactsLocked(ids)
+}
+
+func (h *Hub) referenceImpactsLocked(deliveryIDs []string) []model.ReferenceImpact {
+	var impacts []model.ReferenceImpact
+	for _, reference := range h.store.References() {
+		impact := model.ReferenceImpact{ReferenceID: reference.ID, Name: reference.Name, Status: model.ReferenceValid}
+		for _, deliveryID := range reference.DeliveryIDs {
+			current, ok := h.store.CurrentValue(deliveryID)
+			if !ok {
+				impact.Status = model.ReferenceReview
+				impact.Reason = "referenced delivery is not currently available"
+				impact.DeliveryIDs = append(impact.DeliveryIDs, deliveryID)
+				continue
+			}
+			want, hasBaseline := reference.Baseline[deliveryID]
+			if !hasBaseline {
+				impact.Status = model.ReferenceIncomplete
+				impact.Reason = "baseline fingerprint is missing"
+				impact.DeliveryIDs = append(impact.DeliveryIDs, deliveryID)
+				continue
+			}
+			if model.Fingerprint(current.Observation) != want {
+				impact.Status = model.ReferenceReview
+				impact.Reason = "adopted interpretation differs from referenced value"
+				impact.DeliveryIDs = append(impact.DeliveryIDs, deliveryID)
+			}
+		}
+		if len(impact.DeliveryIDs) == 0 {
+			impact.DeliveryIDs = append([]string(nil), reference.DeliveryIDs...)
+		}
+		impacts = append(impacts, impact)
+	}
+	return impacts
+}
+
+func (h *Hub) CurrentValues(scope model.BranchScope) []model.CurrentValue {
+	return h.store.CurrentValues(scope)
+}
+
+func (h *Hub) CurrentValue(deliveryID string) (model.CurrentValue, bool) {
+	return h.store.CurrentValue(deliveryID)
+}
+
+func (h *Hub) BranchConflicts() []model.BranchConflict {
+	return h.store.BranchConflicts()
 }
 
 // Conflicts returns the preserved evidence of same-sequence content conflicts.

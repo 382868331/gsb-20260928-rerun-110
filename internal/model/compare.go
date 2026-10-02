@@ -1,8 +1,10 @@
 package model
 
 import (
+	"encoding/json"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -36,7 +38,7 @@ var knownUnits = map[string]bool{
 	"a": true, "pa": true, "db": true, "rpm": true,
 }
 
-func splitMeasureName(name string) (base, unit string) {
+func SplitMeasureName(name string) (base, unit string) {
 	idx := strings.LastIndexByte(name, '_')
 	if idx <= 0 || idx == len(name)-1 {
 		return name, ""
@@ -90,20 +92,20 @@ func Compare(oldObs, newObs Observation) Comparison {
 	sort.Strings(oldOrdered)
 	for _, oldK := range oldOrdered {
 		oldV := oldOnly[oldK]
-		oldBase, oldUnit := splitMeasureName(oldK)
+		oldBase, oldUnit := SplitMeasureName(oldK)
 		matched := ""
 		for _, newK := range newKeys {
 			if _, ok := newOnly[newK]; !ok {
 				continue
 			}
-			newBase, newUnit := splitMeasureName(newK)
+			newBase, newUnit := SplitMeasureName(newK)
 			if oldBase == newBase && oldUnit != newUnit {
 				matched = newK
 				break
 			}
 		}
 		if matched != "" {
-			_, newUnit := splitMeasureName(matched)
+			_, newUnit := SplitMeasureName(matched)
 			cmp.Measures = append(cmp.Measures, MeasureDiff{
 				Name: oldBase, OldName: oldK, Kind: "unit",
 				OldValue: oldV, NewValue: newOnly[matched],
@@ -148,4 +150,22 @@ func Compare(oldObs, newObs Observation) Comparison {
 		cmp.Change = ChangeUnchanged
 	}
 	return cmp
+}
+
+// Fingerprint is a compact explanation fingerprint used by downstream
+// consumers to detect whether an adopted correction changes a published value.
+func Fingerprint(observation Observation) string {
+	keys := make([]string, 0, len(observation.Measures))
+	for key := range observation.Measures {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys)+2)
+	parts = append(parts, observation.Type)
+	for _, key := range keys {
+		parts = append(parts, key+"="+strconv.FormatFloat(observation.Measures[key], 'g', -1, 64))
+	}
+	attributeJSON, _ := json.Marshal(observation.Attributes)
+	parts = append(parts, string(attributeJSON))
+	return strings.Join(parts, "\x00")
 }

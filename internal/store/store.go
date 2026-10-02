@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,17 +21,23 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type JournalRecord struct {
-	Kind        string                `json:"kind"`
-	Identity    *model.DeviceIdentity `json:"identity,omitempty"`
-	Raw         *StoredRawMessage     `json:"raw,omitempty"`
-	RawRef      *model.RawReference   `json:"raw_ref,omitempty"`
-	Observation *model.Observation    `json:"observation,omitempty"`
-	Sequence    *SequenceProgress     `json:"sequence,omitempty"`
-	Confirmed   *ConfirmedSequence    `json:"confirmed,omitempty"`
-	Rule        string                `json:"rule,omitempty"`
-	Comparison  *model.Comparison     `json:"comparison,omitempty"`
-	Conflict    *ConflictEvidence     `json:"conflict,omitempty"`
-	Checksum    string                `json:"checksum,omitempty"`
+	Kind           string                     `json:"kind"`
+	Identity       *model.DeviceIdentity      `json:"identity,omitempty"`
+	Raw            *StoredRawMessage          `json:"raw,omitempty"`
+	RawRef         *model.RawReference        `json:"raw_ref,omitempty"`
+	Observation    *model.Observation         `json:"observation,omitempty"`
+	Sequence       *SequenceProgress          `json:"sequence,omitempty"`
+	Confirmed      *ConfirmedSequence         `json:"confirmed,omitempty"`
+	Rule           string                     `json:"rule,omitempty"`
+	Comparison     *model.Comparison          `json:"comparison,omitempty"`
+	Conflict       *ConflictEvidence          `json:"conflict,omitempty"`
+	Branch         *model.CorrectionBranch    `json:"branch,omitempty"`
+	BranchEntry    *model.BranchEntry         `json:"branch_entry,omitempty"`
+	Adoption       *model.Adoption            `json:"adoption,omitempty"`
+	Withdrawal     *model.AdoptionWithdrawal  `json:"withdrawal,omitempty"`
+	BranchConflict *model.BranchConflict      `json:"branch_conflict,omitempty"`
+	Reference      *model.DownstreamReference `json:"reference,omitempty"`
+	Checksum       string                     `json:"checksum,omitempty"`
 }
 
 // ConflictEvidence preserves both sides of a same-sequence conflict:
@@ -45,6 +52,18 @@ type StoredRawMessage struct {
 	model.RawMessage
 	Status      string `json:"status,omitempty"`
 	DuplicateOf string `json:"duplicate_of,omitempty"`
+}
+
+func (r StoredRawMessage) RawReference() model.RawReference {
+	return model.RawReference{
+		DeliveryID:  r.DeliveryID,
+		IdentityID:  r.IdentityID,
+		BootID:      r.BootID,
+		Sequence:    r.Sequence,
+		Format:      r.Format,
+		ContentType: r.ContentType,
+		PayloadSHA:  PayloadSHA(r.Payload),
+	}
 }
 
 type SequenceProgress struct {
@@ -80,6 +99,18 @@ type Store struct {
 	reinterpreted      map[string]struct{}
 	reinterpretRecords []JournalRecord
 	conflicts          []ConflictEvidence
+	branches           map[string]model.CorrectionBranch
+	branchOrder        []string
+	branchEntries      map[string]map[string]model.BranchEntry
+	branchEntryOrder   []string
+	currentByDelivery  map[string]model.CurrentValue
+	currentOrder       []string
+	adoptionByID       map[string]model.Adoption
+	adoptionByDelivery map[string]model.Adoption
+	withdrawals        map[string]map[string]struct{}
+	branchConflicts    []model.BranchConflict
+	references         map[string]model.DownstreamReference
+	referenceOrder     []string
 }
 
 func Open(dir string) (*Store, error) {
@@ -92,20 +123,27 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		path:          path,
-		f:             f,
-		writer:        bufio.NewWriter(f),
-		identities:    make(map[string]model.DeviceIdentity),
-		byHardware:    make(map[string]string),
-		seenObs:       make(map[string]struct{}),
-		sequences:     make(map[string]SequenceProgress),
-		delivered:     make(map[string]map[int64]struct{}),
-		payloads:      make(map[string]map[int64]string),
-		confirmed:     make(map[string]map[int64]struct{}),
-		pending:       make(map[string]model.RawMessage),
-		raws:          make(map[string]StoredRawMessage),
-		obsByDelivery: make(map[string]model.Observation),
-		reinterpreted: make(map[string]struct{}),
+		path:               path,
+		f:                  f,
+		writer:             bufio.NewWriter(f),
+		identities:         make(map[string]model.DeviceIdentity),
+		byHardware:         make(map[string]string),
+		seenObs:            make(map[string]struct{}),
+		sequences:          make(map[string]SequenceProgress),
+		delivered:          make(map[string]map[int64]struct{}),
+		payloads:           make(map[string]map[int64]string),
+		confirmed:          make(map[string]map[int64]struct{}),
+		pending:            make(map[string]model.RawMessage),
+		raws:               make(map[string]StoredRawMessage),
+		obsByDelivery:      make(map[string]model.Observation),
+		reinterpreted:      make(map[string]struct{}),
+		branches:           make(map[string]model.CorrectionBranch),
+		branchEntries:      make(map[string]map[string]model.BranchEntry),
+		currentByDelivery:  make(map[string]model.CurrentValue),
+		adoptionByID:       make(map[string]model.Adoption),
+		adoptionByDelivery: make(map[string]model.Adoption),
+		withdrawals:        make(map[string]map[string]struct{}),
+		references:         make(map[string]model.DownstreamReference),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -457,6 +495,202 @@ func (s *Store) Reinterpretations() []JournalRecord {
 	return out
 }
 
+func (s *Store) SaveBranch(branch model.CorrectionBranch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.branches[branch.ID]; exists {
+		return nil
+	}
+	record := JournalRecord{Kind: "correction_branch", Branch: &branch}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) UpdateBranch(branch model.CorrectionBranch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.branches[branch.ID]; !exists {
+		return ErrNotFound
+	}
+	record := JournalRecord{Kind: "correction_branch", Branch: &branch}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Branch(id string) (model.CorrectionBranch, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	branch, ok := s.branches[id]
+	return branch, ok
+}
+
+func (s *Store) Branches() []model.CorrectionBranch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.CorrectionBranch, 0, len(s.branchOrder))
+	for _, id := range s.branchOrder {
+		out = append(out, s.branches[id])
+	}
+	return out
+}
+
+func (s *Store) BranchEntryExists(branchID, deliveryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.branchEntries[branchID][deliveryID]
+	return ok
+}
+
+func (s *Store) SaveBranchEntry(entry model.BranchEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entries := s.branchEntries[entry.BranchID]; entries != nil {
+		if _, exists := entries[entry.RawRef.DeliveryID]; exists {
+			return nil
+		}
+	}
+	record := JournalRecord{Kind: "branch_entry", BranchEntry: &entry}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) UpdateBranchEntry(entry model.BranchEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := JournalRecord{Kind: "branch_entry", BranchEntry: &entry}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) BranchEntries(branchID string) []model.BranchEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.BranchEntry
+	for _, key := range s.branchEntryOrder {
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) == 2 && parts[0] == branchID {
+			out = append(out, s.branchEntries[branchID][parts[1]])
+		}
+	}
+	return out
+}
+
+func (s *Store) CurrentAdoption(deliveryID string) (model.Adoption, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	adoption, ok := s.adoptionByDelivery[deliveryID]
+	return adoption, ok
+}
+
+func (s *Store) Withdrawn(adoptionID, deliveryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.withdrawals[adoptionID][deliveryID]
+	return ok
+}
+
+func (s *Store) Adopt(adoption model.Adoption) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := JournalRecord{Kind: "adoption", Adoption: &adoption}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Adoption(id string) (model.Adoption, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	adoption, ok := s.adoptionByID[id]
+	return adoption, ok
+}
+
+func (s *Store) WithdrawAdoption(withdrawal model.AdoptionWithdrawal) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := JournalRecord{Kind: "adoption_withdrawal", Withdrawal: &withdrawal}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) RecordBranchConflict(conflict model.BranchConflict) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := JournalRecord{Kind: "branch_conflict", BranchConflict: &conflict}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) BranchConflicts() []model.BranchConflict {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.BranchConflict(nil), s.branchConflicts...)
+}
+
+func (s *Store) RegisterReference(reference model.DownstreamReference) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.references[reference.ID]; exists {
+		return nil
+	}
+	record := JournalRecord{Kind: "downstream_reference", Reference: &reference}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) References() []model.DownstreamReference {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.DownstreamReference, 0, len(s.referenceOrder))
+	for _, id := range s.referenceOrder {
+		out = append(out, s.references[id])
+	}
+	return out
+}
+
+func (s *Store) CurrentValues(scope model.BranchScope) []model.CurrentValue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.CurrentValue, 0, len(s.currentOrder))
+	for _, id := range s.currentOrder {
+		current := s.currentByDelivery[id]
+		if scope.Matches(current.RawRef.IdentityID, current.RawRef.BootID, current.RawRef.Sequence, current.Observation.ReceivedAt) {
+			out = append(out, current)
+		}
+	}
+	return out
+}
+
+func (s *Store) CurrentValue(deliveryID string) (model.CurrentValue, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.currentByDelivery[deliveryID]
+	return current, ok
+}
+
 func reinterpretKey(deliveryID, rule string) string {
 	return deliveryID + "\x00" + rule
 }
@@ -618,6 +852,7 @@ func (s *Store) apply(record JournalRecord) {
 			s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
 			if record.Raw != nil {
 				s.obsByDelivery[record.Raw.DeliveryID] = *record.Observation
+				s.setCurrentOriginalLocked(record.Raw.RawReference(), *record.Observation)
 			}
 		}
 		if record.Sequence != nil {
@@ -628,6 +863,97 @@ func (s *Store) apply(record JournalRecord) {
 			s.reinterpreted[reinterpretKey(record.RawRef.DeliveryID, record.Rule)] = struct{}{}
 		}
 		s.reinterpretRecords = append(s.reinterpretRecords, record)
+	case "correction_branch":
+		if record.Branch != nil {
+			if _, exists := s.branches[record.Branch.ID]; !exists {
+				s.branchOrder = append(s.branchOrder, record.Branch.ID)
+			}
+			s.branches[record.Branch.ID] = *record.Branch
+		}
+	case "branch_entry":
+		if record.BranchEntry != nil {
+			entry := *record.BranchEntry
+			if s.branchEntries[entry.BranchID] == nil {
+				s.branchEntries[entry.BranchID] = make(map[string]model.BranchEntry)
+			}
+			deliveryID := entry.RawRef.DeliveryID
+			if _, exists := s.branchEntries[entry.BranchID][deliveryID]; !exists {
+				s.branchEntryOrder = append(s.branchEntryOrder, entry.BranchID+"\x00"+deliveryID)
+			}
+			s.branchEntries[entry.BranchID][deliveryID] = entry
+		}
+	case "adoption":
+		if record.Adoption != nil {
+			adoption := *record.Adoption
+			s.adoptionByID[adoption.ID] = adoption
+			entries := s.branchEntries[adoption.BranchID]
+			for _, deliveryID := range adoption.DeliveryIDs {
+				entry, ok := entries[deliveryID]
+				if !ok {
+					continue
+				}
+				s.seenObs[observationKey(entry.Observation.IdentityID, entry.Observation.ID)] = struct{}{}
+				s.adoptionByDelivery[deliveryID] = adoption
+				if s.withdrawals[adoption.ID] != nil {
+					if _, withdrawn := s.withdrawals[adoption.ID][deliveryID]; withdrawn {
+						continue
+					}
+				}
+				entry.Status = model.EntryAdopted
+				s.branchEntries[adoption.BranchID][deliveryID] = entry
+				key := sequenceKey(entry.RawRef.IdentityID, entry.RawRef.BootID)
+				if s.confirmed[key] == nil {
+					s.confirmed[key] = make(map[int64]struct{})
+				}
+				s.confirmed[key][entry.RawRef.Sequence] = struct{}{}
+				delete(s.pending, deliveryID)
+				s.setCurrentBranchLocked(entry, adoption)
+			}
+		}
+	case "adoption_withdrawal":
+		if record.Withdrawal != nil {
+			withdrawal := *record.Withdrawal
+			if s.withdrawals[withdrawal.AdoptionID] == nil {
+				s.withdrawals[withdrawal.AdoptionID] = make(map[string]struct{})
+			}
+			for _, deliveryID := range withdrawal.DeliveryIDs {
+				s.withdrawals[withdrawal.AdoptionID][deliveryID] = struct{}{}
+				if adoption, ok := s.adoptionByID[withdrawal.AdoptionID]; ok {
+					_ = adoption
+				}
+				if stored, ok := s.raws[deliveryID]; ok {
+					if original, exists := s.obsByDelivery[deliveryID]; exists {
+						current := model.CurrentValue{
+							DeliveryID:       deliveryID,
+							RawRef:           stored.RawReference(),
+							Observation:      original,
+							Source:           "original",
+							Withdrawn:        true,
+							WithdrawalID:     withdrawal.ID,
+							WithdrawnAt:      withdrawal.WithdrawnAt,
+							WithdrawalReason: withdrawal.Reason,
+						}
+						if adoption, ok := s.adoptionByID[withdrawal.AdoptionID]; ok {
+							current.AdoptionID = adoption.ID
+							current.BranchID = adoption.BranchID
+							current.Rule = adoption.Rule
+						}
+						s.setCurrentLocked(current)
+					}
+				}
+			}
+		}
+	case "branch_conflict":
+		if record.BranchConflict != nil {
+			s.branchConflicts = append(s.branchConflicts, *record.BranchConflict)
+		}
+	case "downstream_reference":
+		if record.Reference != nil {
+			if _, exists := s.references[record.Reference.ID]; !exists {
+				s.referenceOrder = append(s.referenceOrder, record.Reference.ID)
+			}
+			s.references[record.Reference.ID] = *record.Reference
+		}
 	case "conflict":
 		if record.Conflict != nil {
 			s.conflicts = append(s.conflicts, *record.Conflict)
@@ -646,9 +972,7 @@ func (s *Store) apply(record JournalRecord) {
 		if record.Raw != nil && record.Raw.DuplicateOf != "" {
 			s.seenObs[record.Raw.DuplicateOf] = struct{}{}
 		}
-	case "observation":
-		s.applyObservation(record)
-	case "duplicate_observation":
+	case "observation", "duplicate_observation":
 		s.applyObservation(record)
 	case "sequence":
 		if record.Sequence != nil {
@@ -674,6 +998,11 @@ func (s *Store) applyObservation(record JournalRecord) {
 		s.seenObs[observationKey(record.Observation.IdentityID, record.Observation.ID)] = struct{}{}
 		if record.RawRef != nil {
 			s.obsByDelivery[record.RawRef.DeliveryID] = *record.Observation
+			if record.Kind == "observation" {
+				if stored, ok := s.raws[record.RawRef.DeliveryID]; ok {
+					s.setCurrentOriginalLocked(stored.RawReference(), *record.Observation)
+				}
+			}
 		}
 	}
 	if record.Confirmed != nil {
@@ -683,6 +1012,35 @@ func (s *Store) applyObservation(record JournalRecord) {
 		}
 		s.confirmed[key][record.Confirmed.Last] = struct{}{}
 	}
+}
+
+func (s *Store) setCurrentOriginalLocked(reference model.RawReference, observation model.Observation) {
+	s.setCurrentLocked(model.CurrentValue{
+		DeliveryID:  reference.DeliveryID,
+		RawRef:      reference,
+		Observation: observation,
+		Source:      "original",
+	})
+}
+
+func (s *Store) setCurrentBranchLocked(entry model.BranchEntry, adoption model.Adoption) {
+	s.setCurrentLocked(model.CurrentValue{
+		DeliveryID:  entry.RawRef.DeliveryID,
+		RawRef:      entry.RawRef,
+		Observation: entry.Observation,
+		Source:      "branch",
+		BranchID:    entry.BranchID,
+		Rule:        entry.Rule,
+		AdoptionID:  adoption.ID,
+		AdoptedAt:   adoption.AdoptedAt,
+	})
+}
+
+func (s *Store) setCurrentLocked(current model.CurrentValue) {
+	if _, exists := s.currentByDelivery[current.DeliveryID]; !exists {
+		s.currentOrder = append(s.currentOrder, current.DeliveryID)
+	}
+	s.currentByDelivery[current.DeliveryID] = current
 }
 
 func readJournal(r io.Reader) ([]JournalRecord, error) {
