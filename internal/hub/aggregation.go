@@ -247,20 +247,17 @@ func (h *Hub) SignAggregationWindow(req AggregationSignoffRequest) ([]model.Aggr
 	}
 	now := h.now().UTC()
 	signoffs := make([]model.AggregationSignoff, 0, len(operators))
-	existingByOperator := map[string]model.AggregationSignoff{}
+	existingByOperatorRevision := map[string]model.AggregationSignoff{}
 	for _, existing := range h.store.WindowSignoffs(revision.AggregationID, req.WindowID) {
-		existingByOperator[existing.Operator] = existing
+		existingByOperatorRevision[existing.Operator+"\x00"+existing.RevisionID] = existing
 	}
 	for i, operator := range operators {
 		if operator == "" {
 			return nil, fmt.Errorf("aggregation signoff operator is required")
 		}
-		if existing, ok := existingByOperator[operator]; ok {
-			if existing.RevisionID == req.RevisionID {
-				signoffs = append(signoffs, existing)
-				continue
-			}
-			return nil, fmt.Errorf("operator %s already signed window %s for revision %s", operator, req.WindowID, existing.RevisionID)
+		if existing, ok := existingByOperatorRevision[operator+"\x00"+req.RevisionID]; ok {
+			signoffs = append(signoffs, existing)
+			continue
 		}
 		signoff := model.AggregationSignoff{
 			ID:            req.RevisionID + ":" + req.WindowID + ":" + strconv.Itoa(i) + ":" + strconv.FormatInt(now.UnixNano(), 36),
