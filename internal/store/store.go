@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ type JournalRecord struct {
 	Withdrawal     *model.AdoptionWithdrawal  `json:"withdrawal,omitempty"`
 	BranchConflict *model.BranchConflict      `json:"branch_conflict,omitempty"`
 	Reference      *model.DownstreamReference `json:"reference,omitempty"`
+	Aggregation    *model.Aggregation         `json:"aggregation,omitempty"`
+	Revision       *model.AggregationRevision `json:"revision,omitempty"`
+	Signoff        *model.AggregationSignoff  `json:"signoff,omitempty"`
 	Checksum       string                     `json:"checksum,omitempty"`
 }
 
@@ -111,6 +115,11 @@ type Store struct {
 	branchConflicts    []model.BranchConflict
 	references         map[string]model.DownstreamReference
 	referenceOrder     []string
+	aggregations       map[string]model.Aggregation
+	aggregationOrder   []string
+	revisions          map[string]model.AggregationRevision
+	revisionOrder      []string
+	signoffsByWindow   map[string]map[string]model.AggregationSignoff
 }
 
 func Open(dir string) (*Store, error) {
@@ -144,6 +153,9 @@ func Open(dir string) (*Store, error) {
 		adoptionByDelivery: make(map[string]model.Adoption),
 		withdrawals:        make(map[string]map[string]struct{}),
 		references:         make(map[string]model.DownstreamReference),
+		aggregations:       make(map[string]model.Aggregation),
+		revisions:          make(map[string]model.AggregationRevision),
+		signoffsByWindow:   make(map[string]map[string]model.AggregationSignoff),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -691,6 +703,114 @@ func (s *Store) CurrentValue(deliveryID string) (model.CurrentValue, bool) {
 	return current, ok
 }
 
+func (s *Store) SaveAggregation(aggregation model.Aggregation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.aggregations[aggregation.ID]; exists {
+		return nil
+	}
+	record := JournalRecord{Kind: "aggregation", Aggregation: &aggregation}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Aggregation(id string) (model.Aggregation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	aggregation, ok := s.aggregations[id]
+	return aggregation, ok
+}
+
+func (s *Store) Aggregations() []model.Aggregation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Aggregation, 0, len(s.aggregationOrder))
+	for _, id := range s.aggregationOrder {
+		out = append(out, s.aggregations[id])
+	}
+	return out
+}
+
+func (s *Store) SaveRevision(revision model.AggregationRevision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.revisions[revision.ID]; exists {
+		return nil
+	}
+	record := JournalRecord{Kind: "aggregation_revision", Revision: &revision}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) UpdateRevision(revision model.AggregationRevision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.revisions[revision.ID]; !exists {
+		return ErrNotFound
+	}
+	record := JournalRecord{Kind: "aggregation_revision", Revision: &revision}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Revision(id string) (model.AggregationRevision, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	revision, ok := s.revisions[id]
+	return revision, ok
+}
+
+func (s *Store) Revisions(aggregationID string) []model.AggregationRevision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.AggregationRevision
+	for _, id := range s.revisionOrder {
+		revision := s.revisions[id]
+		if aggregationID == "" || revision.AggregationID == aggregationID {
+			out = append(out, revision)
+		}
+	}
+	return out
+}
+
+func (s *Store) SaveAggregationSignoff(signoff model.AggregationSignoff) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := signoff.AggregationID + "\x00" + signoff.WindowID
+	if existing, ok := s.signoffsByWindow[key][signoff.Operator]; ok {
+		if existing.RevisionID == signoff.RevisionID {
+			return nil
+		}
+		return fmt.Errorf("operator %s already signed window %s for revision %s", signoff.Operator, signoff.WindowID, existing.RevisionID)
+	}
+	record := JournalRecord{Kind: "aggregation_signoff", Signoff: &signoff}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) WindowSignoffs(aggregationID, windowID string) []model.AggregationSignoff {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.AggregationSignoff
+	for _, signoff := range s.signoffsByWindow[aggregationID+"\x00"+windowID] {
+		out = append(out, signoff)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].SignedAt.Before(out[j].SignedAt) })
+	return out
+}
+
 func reinterpretKey(deliveryID, rule string) string {
 	return deliveryID + "\x00" + rule
 }
@@ -933,11 +1053,6 @@ func (s *Store) apply(record JournalRecord) {
 							WithdrawnAt:      withdrawal.WithdrawnAt,
 							WithdrawalReason: withdrawal.Reason,
 						}
-						if adoption, ok := s.adoptionByID[withdrawal.AdoptionID]; ok {
-							current.AdoptionID = adoption.ID
-							current.BranchID = adoption.BranchID
-							current.Rule = adoption.Rule
-						}
 						s.setCurrentLocked(current)
 					}
 				}
@@ -953,6 +1068,69 @@ func (s *Store) apply(record JournalRecord) {
 				s.referenceOrder = append(s.referenceOrder, record.Reference.ID)
 			}
 			s.references[record.Reference.ID] = *record.Reference
+		}
+	case "aggregation":
+		if record.Aggregation != nil {
+			if _, exists := s.aggregations[record.Aggregation.ID]; !exists {
+				s.aggregationOrder = append(s.aggregationOrder, record.Aggregation.ID)
+			}
+			s.aggregations[record.Aggregation.ID] = *record.Aggregation
+		}
+	case "aggregation_revision":
+		if record.Revision != nil {
+			if _, exists := s.revisions[record.Revision.ID]; !exists {
+				s.revisionOrder = append(s.revisionOrder, record.Revision.ID)
+			}
+			revision := *record.Revision
+			for i := range revision.Windows {
+				key := revision.AggregationID + "\x00" + revision.Windows[i].Window.ID
+				for _, signoff := range s.signoffsByWindow[key] {
+					if signoff.RevisionID == revision.ID {
+						revision.Windows[i].Status = model.AggregationWindowSigned
+					}
+				}
+			}
+			s.revisions[record.Revision.ID] = revision
+		}
+	case "aggregation_signoff":
+		if record.Signoff != nil {
+			signoff := *record.Signoff
+			key := signoff.AggregationID + "\x00" + signoff.WindowID
+			if s.signoffsByWindow[key] == nil {
+				s.signoffsByWindow[key] = make(map[string]model.AggregationSignoff)
+			}
+			if prior, exists := s.signoffsByWindow[key][signoff.Operator]; !exists || prior.RevisionID != signoff.RevisionID || prior.WindowID != signoff.WindowID {
+				s.signoffsByWindow[key][signoff.Operator] = signoff
+			}
+			revision := s.revisions[signoff.RevisionID]
+			for i := range revision.Windows {
+				if revision.Windows[i].Window.ID != signoff.WindowID {
+					continue
+				}
+				hasSignoff := false
+				for _, prior := range revision.Windows[i].Signoffs {
+					if prior.ID == signoff.ID {
+						hasSignoff = true
+					}
+				}
+				if !hasSignoff {
+					revision.Windows[i].Status = model.AggregationWindowSigned
+					revision.Windows[i].Signoffs = append(revision.Windows[i].Signoffs, signoff)
+				}
+			}
+			signed := 0
+			for _, window := range revision.Windows {
+				if window.Status == model.AggregationWindowSigned {
+					signed++
+				}
+			}
+			if signed > 0 {
+				revision.Status = model.AggregationRevisionPartial
+			}
+			if signed == len(revision.Windows) {
+				revision.Status = model.AggregationRevisionSigned
+			}
+			s.revisions[revision.ID] = revision
 		}
 	case "conflict":
 		if record.Conflict != nil {
