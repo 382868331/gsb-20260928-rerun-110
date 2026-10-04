@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ type JournalRecord struct {
 	Withdrawal     *model.AdoptionWithdrawal  `json:"withdrawal,omitempty"`
 	BranchConflict *model.BranchConflict      `json:"branch_conflict,omitempty"`
 	Reference      *model.DownstreamReference `json:"reference,omitempty"`
+	Aggregate      *model.AggregateSpec       `json:"aggregate,omitempty"`
+	AggInterval    *model.AggregateInterval   `json:"aggregate_interval,omitempty"`
+	Signoff        *model.AggregateSignoff    `json:"aggregate_signoff,omitempty"`
 	Checksum       string                     `json:"checksum,omitempty"`
 }
 
@@ -111,6 +115,10 @@ type Store struct {
 	branchConflicts    []model.BranchConflict
 	references         map[string]model.DownstreamReference
 	referenceOrder     []string
+	aggregates         map[string]model.AggregateSpec
+	aggregateOrder     []string
+	intervals          map[string]map[string][]model.AggregateInterval
+	signoffs           map[string]map[string][]model.AggregateSignoff
 }
 
 func Open(dir string) (*Store, error) {
@@ -144,6 +152,9 @@ func Open(dir string) (*Store, error) {
 		adoptionByDelivery: make(map[string]model.Adoption),
 		withdrawals:        make(map[string]map[string]struct{}),
 		references:         make(map[string]model.DownstreamReference),
+		aggregates:         make(map[string]model.AggregateSpec),
+		intervals:          make(map[string]map[string][]model.AggregateInterval),
+		signoffs:           make(map[string]map[string][]model.AggregateSignoff),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -691,6 +702,121 @@ func (s *Store) CurrentValue(deliveryID string) (model.CurrentValue, bool) {
 	return current, ok
 }
 
+// SaveAggregate stores an aggregate definition. Re-defining with the same
+// ID is a no-op so an interrupted setup can be retried safely.
+func (s *Store) SaveAggregate(spec model.AggregateSpec) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.aggregates[spec.ID]; exists {
+		return nil
+	}
+	record := JournalRecord{Kind: "aggregate", Aggregate: &spec}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) Aggregate(id string) (model.AggregateSpec, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	spec, ok := s.aggregates[id]
+	return spec, ok
+}
+
+func (s *Store) Aggregates() []model.AggregateSpec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.AggregateSpec, 0, len(s.aggregateOrder))
+	for _, id := range s.aggregateOrder {
+		out = append(out, s.aggregates[id])
+	}
+	return out
+}
+
+// SaveAggregateInterval appends one computed interval revision. A revision
+// that is already durable is skipped, which keeps a resumed run idempotent.
+func (s *Store) SaveAggregateInterval(interval model.AggregateInterval) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.intervals[interval.AggregateID][interval.ID] {
+		if existing.Revision == interval.Revision {
+			return nil
+		}
+	}
+	record := JournalRecord{Kind: "aggregate_interval", AggInterval: &interval}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+// AggregateIntervals returns the latest revision of each interval, ordered
+// by interval start.
+func (s *Store) AggregateIntervals(aggregateID string) []model.AggregateInterval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	revisions := s.intervals[aggregateID]
+	out := make([]model.AggregateInterval, 0, len(revisions))
+	for _, list := range revisions {
+		if len(list) != 0 {
+			out = append(out, list[len(list)-1])
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
+	return out
+}
+
+// AggregateIntervalRevision returns a specific interval revision, used to
+// show the still-published old statistic after newer revisions exist.
+func (s *Store) AggregateIntervalRevision(aggregateID, intervalID string, revision int) (model.AggregateInterval, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.intervals[aggregateID][intervalID] {
+		if existing.Revision == revision {
+			return existing, true
+		}
+	}
+	return model.AggregateInterval{}, false
+}
+
+// SaveAggregateSignoff appends a per-interval sign-off record. The same
+// sign-off ID is never written twice, so a retried batch cannot duplicate
+// an already durable decision.
+func (s *Store) SaveAggregateSignoff(signoff model.AggregateSignoff) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.signoffs[signoff.AggregateID][signoff.IntervalID] {
+		if existing.ID == signoff.ID {
+			return nil
+		}
+	}
+	record := JournalRecord{Kind: "aggregate_signoff", Signoff: &signoff}
+	if err := s.append(record); err != nil {
+		return err
+	}
+	s.apply(record)
+	return nil
+}
+
+func (s *Store) AggregateSignoffs(aggregateID string) []model.AggregateSignoff {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.AggregateSignoff
+	for _, list := range s.signoffs[aggregateID] {
+		out = append(out, list...)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Start.Equal(out[j].Start) {
+			return out[i].SignedAt.Before(out[j].SignedAt)
+		}
+		return out[i].Start.Before(out[j].Start)
+	})
+	return out
+}
+
 func reinterpretKey(deliveryID, rule string) string {
 	return deliveryID + "\x00" + rule
 }
@@ -953,6 +1079,49 @@ func (s *Store) apply(record JournalRecord) {
 				s.referenceOrder = append(s.referenceOrder, record.Reference.ID)
 			}
 			s.references[record.Reference.ID] = *record.Reference
+		}
+	case "aggregate":
+		if record.Aggregate != nil {
+			if _, exists := s.aggregates[record.Aggregate.ID]; !exists {
+				s.aggregateOrder = append(s.aggregateOrder, record.Aggregate.ID)
+			}
+			s.aggregates[record.Aggregate.ID] = *record.Aggregate
+		}
+	case "aggregate_interval":
+		if record.AggInterval != nil {
+			interval := *record.AggInterval
+			if s.intervals[interval.AggregateID] == nil {
+				s.intervals[interval.AggregateID] = make(map[string][]model.AggregateInterval)
+			}
+			revisions := s.intervals[interval.AggregateID][interval.ID]
+			known := false
+			for _, existing := range revisions {
+				if existing.Revision == interval.Revision {
+					known = true
+					break
+				}
+			}
+			if !known {
+				s.intervals[interval.AggregateID][interval.ID] = append(revisions, interval)
+			}
+		}
+	case "aggregate_signoff":
+		if record.Signoff != nil {
+			signoff := *record.Signoff
+			if s.signoffs[signoff.AggregateID] == nil {
+				s.signoffs[signoff.AggregateID] = make(map[string][]model.AggregateSignoff)
+			}
+			records := s.signoffs[signoff.AggregateID][signoff.IntervalID]
+			known := false
+			for _, existing := range records {
+				if existing.ID == signoff.ID {
+					known = true
+					break
+				}
+			}
+			if !known {
+				s.signoffs[signoff.AggregateID][signoff.IntervalID] = append(records, signoff)
+			}
 		}
 	case "conflict":
 		if record.Conflict != nil {
