@@ -2,6 +2,7 @@ package hub_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -1029,5 +1030,179 @@ func TestAggregationRevisionPartialSignoffAndWithdrawalBasis(t *testing.T) {
 	restart, err := h2.AggregationResult("agg-a")
 	if err != nil || restart.Windows[0].RevisionID != "agg-a:unit-ready" || restart.Windows[1].RevisionID != "agg-a:baseline" || len(restart.Windows[0].RestoreFrom) != 1 {
 		t.Fatalf("restart aggregation = %+v, %v", restart, err)
+	}
+}
+
+func TestAggregationSignoffScopedToRevision(t *testing.T) {
+	h, s, dir := newHub(t)
+	base := time.Date(2026, 10, 3, 8, 0, 0, 0, time.UTC)
+	clock := base
+	h.SetClock(func() time.Time { return clock })
+	if err := h.Provision("temp-1", "hw-1", device.TemperatureType, base); err != nil {
+		t.Fatal(err)
+	}
+	d := device.NewTemperature("temp-1", "hw-1", "boot-1", 1)
+	clock = base.Add(time.Minute)
+	if _, err := h.Receive("temp-1", d.Reading(clock, 10, 40)); err != nil {
+		t.Fatal(err)
+	}
+	clock = base.Add(2 * time.Minute)
+	if _, err := h.Receive("temp-1", d.Reading(clock, 20, 50)); err != nil {
+		t.Fatal(err)
+	}
+	window1 := model.AggregationWindow{ID: "first", IdentityID: "temp-1", From: base, To: base.Add(90 * time.Second)}
+	window2 := model.AggregationWindow{ID: "second", IdentityID: "temp-1", From: base.Add(90 * time.Second), To: base.Add(3 * time.Minute)}
+	if _, err := h.RegisterAggregation(hub.AggregationRequest{ID: "agg-a", Name: "A", Operator: "owner", Windows: []model.AggregationWindow{window1, window2}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.RegisterAggregation(hub.AggregationRequest{ID: "agg-b", Name: "B", Operator: "owner", Windows: []model.AggregationWindow{window1, window2}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.CreateCorrectionBranch(hub.CorrectionRequest{
+		ID: "fahrenheit-scope", Rule: unitChangeRule{}, Operator: "alice",
+		Reason: "unit correction", Scope: model.BranchScope{IdentityID: "temp-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.PreviewAggregationRevision(hub.AggregationRevisionRequest{
+		ID: "agg-a:rev-1", AggregationID: "agg-a", BranchID: "fahrenheit-scope", Operator: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := h.AdoptBranch(hub.AdoptionRequest{
+		BranchID: "fahrenheit-scope", Operator: "alice",
+		Scope: model.BranchScope{IdentityID: "temp-1", FromSequence: 1, ToSequence: 1},
+	})
+	if err != nil || adopted.Adoption == nil {
+		t.Fatalf("adoption = %+v, %v", adopted, err)
+	}
+	if _, err := h.PreviewAggregationRevision(hub.AggregationRevisionRequest{
+		ID: "agg-a:rev-1", AggregationID: "agg-a", BranchID: "fahrenheit-scope", Operator: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := h.SignAggregationWindow(hub.AggregationSignoffRequest{
+		RevisionID: "agg-a:rev-1", WindowID: "first", Operators: []string{"alice"},
+	})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first signoff = %+v, %v", first, err)
+	}
+	duplicate, err := h.SignAggregationWindow(hub.AggregationSignoffRequest{
+		RevisionID: "agg-a:rev-1", WindowID: "first", Operators: []string{"alice"},
+	})
+	if err != nil || len(duplicate) != 1 || duplicate[0].ID != first[0].ID {
+		t.Fatalf("duplicate signoff = %+v, %v", duplicate, err)
+	}
+	if got := len(s.WindowSignoffs("agg-a", "first")); got != 1 {
+		t.Fatalf("duplicate signoff persisted extra records: %d", got)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, operator := range []string{"bob", "carol"} {
+		wg.Add(1)
+		go func(operator string) {
+			defer wg.Done()
+			signoffs, err := h.SignAggregationWindow(hub.AggregationSignoffRequest{
+				RevisionID: "agg-a:rev-1", WindowID: "first", Operators: []string{operator},
+			})
+			if err == nil && len(signoffs) != 1 {
+				err = fmt.Errorf("operator %s got %+v", operator, signoffs)
+			}
+			errs <- err
+		}(operator)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(s.WindowSignoffs("agg-a", "first")); got != 3 {
+		t.Fatalf("concurrent signoffs = %d, want 3", got)
+	}
+
+	if _, err := h.WithdrawAdoption(adopted.Adoption.ID, "bob", "unit correction disputed", model.BranchScope{FromSequence: 1, ToSequence: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.CreateCorrectionBranch(hub.CorrectionRequest{
+		ID: "corrected-scope", Rule: correctedTempRule{}, Operator: "alice",
+		Reason: "sensor offset", Scope: model.BranchScope{IdentityID: "temp-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.PreviewAggregationRevision(hub.AggregationRevisionRequest{
+		ID: "agg-a:rev-2", AggregationID: "agg-a", BranchID: "corrected-scope", Operator: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readopted, err := h.AdoptBranch(hub.AdoptionRequest{
+		BranchID: "corrected-scope", Operator: "alice",
+		Scope: model.BranchScope{IdentityID: "temp-1", FromSequence: 1, ToSequence: 1},
+	})
+	if err != nil || readopted.Adoption == nil {
+		t.Fatalf("re-adoption = %+v, %v", readopted, err)
+	}
+	if _, err := h.PreviewAggregationRevision(hub.AggregationRevisionRequest{
+		ID: "agg-a:rev-2", AggregationID: "agg-a", BranchID: "corrected-scope", Operator: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	followup, err := h.SignAggregationWindow(hub.AggregationSignoffRequest{
+		RevisionID: "agg-a:rev-2", WindowID: "first", Operators: []string{"alice"},
+	})
+	if err != nil || len(followup) != 1 {
+		t.Fatalf("same operator cannot sign follow-up revision: %+v, %v", followup, err)
+	}
+	signoffs := s.WindowSignoffs("agg-a", "first")
+	if len(signoffs) != 4 {
+		t.Fatalf("old signoffs not preserved: %+v", signoffs)
+	}
+	byOperatorRevision := map[string]int{}
+	for _, signoff := range signoffs {
+		byOperatorRevision[signoff.Operator+"@"+signoff.RevisionID]++
+	}
+	if byOperatorRevision["alice@agg-a:rev-1"] != 1 || byOperatorRevision["alice@agg-a:rev-2"] != 1 ||
+		byOperatorRevision["bob@agg-a:rev-1"] != 1 || byOperatorRevision["carol@agg-a:rev-1"] != 1 {
+		t.Fatalf("signoff history = %+v", byOperatorRevision)
+	}
+
+	resultA, err := h.AggregationResult("agg-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resultA.Windows[0].RevisionID != "agg-a:rev-2" || resultA.Windows[0].Statistics["temperature_c"].Count != 1 {
+		t.Fatalf("signed follow-up window = %+v", resultA.Windows[0])
+	}
+	if resultA.Windows[0].Status == model.AggregationWindowPending {
+		t.Fatalf("explicitly signed window still pending = %+v", resultA.Windows[0])
+	}
+	if resultA.Windows[1].RevisionID != "agg-a:baseline" || resultA.Windows[1].Status != model.AggregationWindowPending {
+		t.Fatalf("unsigned window changed = %+v", resultA.Windows[1])
+	}
+	resultB, err := h.AggregationResult("agg-b")
+	if err != nil || resultB.Windows[0].RevisionID != "agg-b:baseline" || resultB.Windows[0].Statistics["temperature_c"].Count != 1 {
+		t.Fatalf("shared-observation aggregation changed = %+v, %v", resultB, err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := hub.New(s2, adapter.NewRegistry(device.TemperatureAdapter{}, device.TemperatureV2Adapter{}, device.VibrationAdapter{}))
+	restart, err := h2.AggregationResult("agg-a")
+	if err != nil || restart.Windows[0].RevisionID != "agg-a:rev-2" || restart.Windows[1].RevisionID != "agg-a:baseline" {
+		t.Fatalf("restart aggregation = %+v, %v", restart, err)
+	}
+	if got := len(s2.WindowSignoffs("agg-a", "first")); got != 4 {
+		t.Fatalf("restart signoffs = %d, want 4", got)
+	}
+	revision, ok := s2.Revision("agg-a:rev-2")
+	if !ok || revision.Windows[0].Status != model.AggregationWindowSigned || len(revision.Windows[0].Signoffs) != 1 {
+		t.Fatalf("restart revision window = %+v, ok=%v", revision.Windows, ok)
 	}
 }

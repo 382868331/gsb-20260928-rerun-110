@@ -119,7 +119,12 @@ type Store struct {
 	aggregationOrder   []string
 	revisions          map[string]model.AggregationRevision
 	revisionOrder      []string
-	signoffsByWindow   map[string]map[string]model.AggregationSignoff
+	// signoffsByWindow keeps signoffs per aggregation+window in journal
+	// order; signoffIndex deduplicates by operator+revision so one operator
+	// may sign successive revisions of the same window while older signoff
+	// records are preserved.
+	signoffsByWindow map[string][]model.AggregationSignoff
+	signoffIndex     map[string]map[string]struct{}
 }
 
 func Open(dir string) (*Store, error) {
@@ -155,7 +160,8 @@ func Open(dir string) (*Store, error) {
 		references:         make(map[string]model.DownstreamReference),
 		aggregations:       make(map[string]model.Aggregation),
 		revisions:          make(map[string]model.AggregationRevision),
-		signoffsByWindow:   make(map[string]map[string]model.AggregationSignoff),
+		signoffsByWindow:   make(map[string][]model.AggregationSignoff),
+		signoffIndex:       make(map[string]map[string]struct{}),
 	}
 	if err := s.replay(); err != nil {
 		_ = f.Close()
@@ -786,11 +792,8 @@ func (s *Store) SaveAggregationSignoff(signoff model.AggregationSignoff) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := signoff.AggregationID + "\x00" + signoff.WindowID
-	if existing, ok := s.signoffsByWindow[key][signoff.Operator]; ok {
-		if existing.RevisionID == signoff.RevisionID {
-			return nil
-		}
-		return fmt.Errorf("operator %s already signed window %s for revision %s", signoff.Operator, signoff.WindowID, existing.RevisionID)
+	if _, ok := s.signoffIndex[key][signoffKey(signoff.Operator, signoff.RevisionID)]; ok {
+		return nil
 	}
 	record := JournalRecord{Kind: "aggregation_signoff", Signoff: &signoff}
 	if err := s.append(record); err != nil {
@@ -809,6 +812,10 @@ func (s *Store) WindowSignoffs(aggregationID, windowID string) []model.Aggregati
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].SignedAt.Before(out[j].SignedAt) })
 	return out
+}
+
+func signoffKey(operator, revisionID string) string {
+	return operator + "\x00" + revisionID
 }
 
 func reinterpretKey(deliveryID, rule string) string {
@@ -1096,11 +1103,13 @@ func (s *Store) apply(record JournalRecord) {
 		if record.Signoff != nil {
 			signoff := *record.Signoff
 			key := signoff.AggregationID + "\x00" + signoff.WindowID
-			if s.signoffsByWindow[key] == nil {
-				s.signoffsByWindow[key] = make(map[string]model.AggregationSignoff)
+			if s.signoffIndex[key] == nil {
+				s.signoffIndex[key] = make(map[string]struct{})
 			}
-			if prior, exists := s.signoffsByWindow[key][signoff.Operator]; !exists || prior.RevisionID != signoff.RevisionID || prior.WindowID != signoff.WindowID {
-				s.signoffsByWindow[key][signoff.Operator] = signoff
+			operatorKey := signoffKey(signoff.Operator, signoff.RevisionID)
+			if _, exists := s.signoffIndex[key][operatorKey]; !exists {
+				s.signoffIndex[key][operatorKey] = struct{}{}
+				s.signoffsByWindow[key] = append(s.signoffsByWindow[key], signoff)
 			}
 			revision := s.revisions[signoff.RevisionID]
 			for i := range revision.Windows {
