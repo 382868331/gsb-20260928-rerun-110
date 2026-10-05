@@ -269,6 +269,31 @@ func (h *Hub) SignAggregationWindow(req AggregationSignoffRequest) ([]model.Aggr
 		}
 		signoffs = append(signoffs, signoff)
 	}
+	var windowSignoffs []model.AggregationSignoff
+	for _, existing := range h.store.WindowSignoffs(revision.AggregationID, req.WindowID) {
+		if existing.RevisionID == revision.ID {
+			windowSignoffs = append(windowSignoffs, existing)
+		}
+	}
+	sort.SliceStable(windowSignoffs, func(i, j int) bool { return windowSignoffs[i].SignedAt.Before(windowSignoffs[j].SignedAt) })
+	window.Status = model.AggregationWindowSigned
+	window.Reason = ""
+	window.Signoffs = windowSignoffs
+	allSigned := true
+	for _, candidate := range revision.Windows {
+		if candidate.Status != model.AggregationWindowSigned {
+			allSigned = false
+			break
+		}
+	}
+	if allSigned {
+		revision.Status = model.AggregationRevisionSigned
+	} else {
+		revision.Status = model.AggregationRevisionPartial
+	}
+	if err := h.store.UpdateRevision(revision); err != nil {
+		return signoffs, err
+	}
 	return signoffs, nil
 }
 
@@ -281,13 +306,17 @@ func (h *Hub) AggregationResult(aggregationID string) (model.AggregationResult, 
 	}
 	result := model.AggregationResult{Aggregation: aggregation}
 	for _, window := range aggregation.Windows {
-		published, publishedRevisionID, _ := h.publishedWindowRevisionLocked(aggregation, window.ID)
+		published, publishedRevisionID, signedAt := h.publishedWindowRevisionLocked(aggregation, window.ID)
 		currentValues := h.aggregationValuesLocked(window)
 		if publishedRevisionID == "" {
 			publishedRevisionID = aggregationID + ":baseline"
 		}
+		status := published.Status
+		if !signedAt.IsZero() {
+			status = model.AggregationWindowSigned
+		}
 		windowResult := model.AggregationWindowResult{
-			Window: window, Status: published.Status, RevisionID: publishedRevisionID,
+			Window: window, Status: status, RevisionID: publishedRevisionID,
 			Statistics: published.Statistics, Values: published.Values,
 		}
 		if !sameFingerprints(fingerprints(published.Values), fingerprints(currentValues)) {
@@ -331,23 +360,37 @@ func (h *Hub) publishedWindowRevisionLocked(aggregation model.Aggregation, windo
 }
 
 func (h *Hub) pendingAggregationReasonLocked(aggregationID, windowID string) string {
-	var latest time.Time
-	reason := ""
-	for _, revision := range h.store.Revisions(aggregationID) {
-		if revision.Status == model.AggregationRevisionSigned || revision.ID == aggregationID+":baseline" {
+	signedRevisions := map[string]struct{}{}
+	for _, signoff := range h.store.WindowSignoffs(aggregationID, windowID) {
+		signedRevisions[signoff.RevisionID] = struct{}{}
+	}
+	revisions := h.store.Revisions(aggregationID)
+	for i := len(revisions) - 1; i >= 0; i-- {
+		revision := revisions[i]
+		if revision.ID == aggregationID+":baseline" {
 			continue
 		}
+		covered := false
+		reason := ""
 		for _, window := range revision.Windows {
-			if window.Window.ID != windowID {
-				continue
-			}
-			if revision.CreatedAt.After(latest) {
-				latest = revision.CreatedAt
+			if window.Window.ID == windowID {
+				covered = true
 				reason = window.Reason
+				break
 			}
 		}
+		if !covered {
+			continue
+		}
+		if revision.Status == model.AggregationRevisionSigned {
+			return ""
+		}
+		if _, signed := signedRevisions[revision.ID]; signed {
+			return ""
+		}
+		return reason
 	}
-	return reason
+	return ""
 }
 
 func (h *Hub) branchRuleLocked(branchID string) string {

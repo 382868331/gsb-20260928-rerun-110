@@ -1028,6 +1028,9 @@ func TestAggregationSignoffScopedToRevision(t *testing.T) {
 	if result.Windows[0].RevisionID != "agg-c:rev-2" || result.Windows[1].RevisionID != "agg-c:rev-2" {
 		t.Fatalf("signed windows not updated = %+v", result.Windows)
 	}
+	if result.Windows[0].Status != model.AggregationWindowSigned || result.Windows[1].Status != model.AggregationWindowSigned {
+		t.Fatalf("signed windows still pending = %+v", result.Windows)
+	}
 	if result.Windows[2].RevisionID != "agg-c:baseline" || result.Windows[2].Status != model.AggregationWindowRestore || result.Windows[2].Statistics["temperature_c"].Count != 2 || len(result.Windows[2].RestoreFrom) != 2 {
 		t.Fatalf("unsigned window lost baseline and restore basis = %+v", result.Windows[2])
 	}
@@ -1046,6 +1049,9 @@ func TestAggregationSignoffScopedToRevision(t *testing.T) {
 	restart, err := h2.AggregationResult("agg-c")
 	if err != nil || restart.Windows[0].RevisionID != "agg-c:rev-2" || restart.Windows[1].RevisionID != "agg-c:rev-2" || restart.Windows[2].RevisionID != "agg-c:baseline" {
 		t.Fatalf("restart aggregation = %+v, %v", restart, err)
+	}
+	if restart.Windows[0].Status != model.AggregationWindowSigned || restart.Windows[1].Status != model.AggregationWindowSigned {
+		t.Fatalf("restart lost signed status = %+v", restart.Windows)
 	}
 	if got := s2.WindowSignoffs("agg-c", "first"); len(got) != 2 {
 		t.Fatalf("restart lost signoff history = %+v", got)
@@ -1134,6 +1140,9 @@ func TestAggregationRevisionPartialSignoffAndWithdrawalBasis(t *testing.T) {
 	}
 	if resultA.Windows[0].RevisionID != "agg-a:unit-ready" || resultA.Windows[0].Statistics["temperature_f"].Count != 1 {
 		t.Fatalf("signed window = %+v", resultA.Windows[0])
+	}
+	if resultA.Windows[0].Status != model.AggregationWindowSigned {
+		t.Fatalf("signed window still pending = %+v", resultA.Windows[0])
 	}
 	if resultA.Windows[1].RevisionID != "agg-a:baseline" || resultA.Windows[1].Statistics["temperature_c"].Count != 1 {
 		t.Fatalf("unsigned window lost baseline = %+v", resultA.Windows[1])
