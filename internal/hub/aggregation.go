@@ -107,7 +107,8 @@ func (h *Hub) PreviewAggregationRevision(req AggregationRevisionRequest) (model.
 		refreshed := existing
 		refreshed.Windows = nil
 		for _, oldWindow := range existing.Windows {
-			if oldWindow.Status == model.AggregationWindowSigned {
+			if oldWindow.Status == model.AggregationWindowSigned || h.windowSignedLocked(existing.AggregationID, oldWindow.Window.ID, existing.ID) {
+				oldWindow.Status = model.AggregationWindowSigned
 				refreshed.Windows = append(refreshed.Windows, oldWindow)
 				continue
 			}
@@ -251,7 +252,7 @@ func (h *Hub) SignAggregationWindow(req AggregationSignoffRequest) ([]model.Aggr
 	for _, existing := range h.store.WindowSignoffs(revision.AggregationID, req.WindowID) {
 		existingByOperatorRevision[existing.Operator+"\x00"+existing.RevisionID] = existing
 	}
-	for i, operator := range operators {
+	for _, operator := range operators {
 		if operator == "" {
 			return nil, fmt.Errorf("aggregation signoff operator is required")
 		}
@@ -260,7 +261,7 @@ func (h *Hub) SignAggregationWindow(req AggregationSignoffRequest) ([]model.Aggr
 			continue
 		}
 		signoff := model.AggregationSignoff{
-			ID:            req.RevisionID + ":" + req.WindowID + ":" + strconv.Itoa(i) + ":" + strconv.FormatInt(now.UnixNano(), 36),
+			ID:            req.RevisionID + ":" + req.WindowID + ":" + operator,
 			AggregationID: revision.AggregationID, RevisionID: revision.ID, WindowID: req.WindowID,
 			Operator: operator, Reason: req.Reason, SignedAt: now,
 		}
@@ -333,6 +334,7 @@ func (h *Hub) publishedWindowRevisionLocked(aggregation model.Aggregation, windo
 func (h *Hub) pendingAggregationReasonLocked(aggregationID, windowID string) string {
 	var latest time.Time
 	reason := ""
+	signed := false
 	for _, revision := range h.store.Revisions(aggregationID) {
 		if revision.Status == model.AggregationRevisionSigned || revision.ID == aggregationID+":baseline" {
 			continue
@@ -344,10 +346,23 @@ func (h *Hub) pendingAggregationReasonLocked(aggregationID, windowID string) str
 			if revision.CreatedAt.After(latest) {
 				latest = revision.CreatedAt
 				reason = window.Reason
+				signed = window.Status == model.AggregationWindowSigned || h.windowSignedLocked(aggregationID, windowID, revision.ID)
 			}
 		}
 	}
+	if signed {
+		return ""
+	}
 	return reason
+}
+
+func (h *Hub) windowSignedLocked(aggregationID, windowID, revisionID string) bool {
+	for _, signoff := range h.store.WindowSignoffs(aggregationID, windowID) {
+		if signoff.RevisionID == revisionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) branchRuleLocked(branchID string) string {

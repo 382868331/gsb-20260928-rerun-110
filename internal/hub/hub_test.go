@@ -1028,6 +1028,33 @@ func TestAggregationSignoffScopedToRevision(t *testing.T) {
 	if result.Windows[0].RevisionID != "agg-c:rev-2" || result.Windows[1].RevisionID != "agg-c:rev-2" {
 		t.Fatalf("signed windows not updated = %+v", result.Windows)
 	}
+	if result.Windows[0].Status != model.AggregationWindowSigned || result.Windows[1].Status != model.AggregationWindowSigned {
+		t.Fatalf("signed windows still pending = %+v", result.Windows)
+	}
+	rev2, ok := s.Revision("agg-c:rev-2")
+	if !ok {
+		t.Fatal("revision agg-c:rev-2 missing")
+	}
+	secondOperators := map[string]bool{}
+	for _, signoff := range rev2.Windows[1].Signoffs {
+		secondOperators[signoff.Operator] = true
+	}
+	if !secondOperators["bob"] || !secondOperators["carol"] {
+		t.Fatalf("concurrent operator identity lost = %+v", rev2.Windows[1].Signoffs)
+	}
+	reopened, err := h.PreviewAggregationRevision(hub.AggregationRevisionRequest{
+		ID: "agg-c:rev-2", AggregationID: "agg-c", BranchID: "fahrenheit-c", Operator: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Windows[0].Status != model.AggregationWindowSigned || reopened.Windows[1].Status != model.AggregationWindowSigned {
+		t.Fatalf("reopened preview lost signed status = %+v", reopened.Windows)
+	}
+	again, err := h.AggregationResult("agg-c")
+	if err != nil || again.Windows[0].Status != model.AggregationWindowSigned || again.Windows[1].Status != model.AggregationWindowSigned {
+		t.Fatalf("reopen changed signed result = %+v, %v", again, err)
+	}
 	if result.Windows[2].RevisionID != "agg-c:baseline" || result.Windows[2].Status != model.AggregationWindowRestore || result.Windows[2].Statistics["temperature_c"].Count != 2 || len(result.Windows[2].RestoreFrom) != 2 {
 		t.Fatalf("unsigned window lost baseline and restore basis = %+v", result.Windows[2])
 	}
@@ -1046,6 +1073,9 @@ func TestAggregationSignoffScopedToRevision(t *testing.T) {
 	restart, err := h2.AggregationResult("agg-c")
 	if err != nil || restart.Windows[0].RevisionID != "agg-c:rev-2" || restart.Windows[1].RevisionID != "agg-c:rev-2" || restart.Windows[2].RevisionID != "agg-c:baseline" {
 		t.Fatalf("restart aggregation = %+v, %v", restart, err)
+	}
+	if restart.Windows[0].Status != model.AggregationWindowSigned || restart.Windows[1].Status != model.AggregationWindowSigned {
+		t.Fatalf("restart lost signed status = %+v", restart.Windows)
 	}
 	if got := s2.WindowSignoffs("agg-c", "first"); len(got) != 2 {
 		t.Fatalf("restart lost signoff history = %+v", got)
